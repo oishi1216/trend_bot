@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ app_name }}</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color-scheme: light dark; }
+    body { max-width: 1100px; margin: 0 auto; padding: 24px; }
+    header { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
+    button { padding: 10px 16px; cursor: pointer; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 12px; }
+    .card { border: 1px solid #8886; border-radius: 12px; padding: 16px; }
+    .warning { border-left: 5px solid; padding: 12px; margin: 16px 0; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #8885; font-size: 14px; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .muted { opacity: .72; }
+  </style>
+</head>
+<body>
+<header>
+  <div><h1>{{ app_name }}</h1><div class="muted">日足トレンドフォロー自動売買 MVP</div></div>
+  <button id="run">今すぐ1回実行</button>
+</header>
+<div class="warning">実口座の利益を保証するものではありません。最初は paper または practice だけで検証してください。</div>
+<div id="summary" class="grid"></div>
+<h2>ポジション</h2>
+<div class="card"><table><thead><tr><th>通貨</th><th>方向</th><th>数量</th><th>建値</th><th>損切り</th><th>予定リスク</th></tr></thead><tbody id="positions"></tbody></table></div>
+<h2>最近のイベント</h2>
+<div id="events"></div>
+<script>
+const money = x => x == null ? '-' : Number(x).toLocaleString(undefined,{maximumFractionDigits:2});
+async function refresh(){
+  const [s,e] = await Promise.all([fetch('/api/status').then(r=>r.json()), fetch('/api/events?limit=30').then(r=>r.json())]);
+  document.getElementById('summary').innerHTML = `
+    <div class="card"><b>モード</b><div>${s.mode}</div></div>
+    <div class="card"><b>新規取引</b><div>${s.trading_armed ? 'ARMED' : '停止中'}</div></div>
+    <div class="card"><b>NAV</b><div>${money(s.nav)}</div><small>${s.nav_error || ''}</small></div>
+    <div class="card"><b>ドローダウン</b><div>${s.drawdown == null ? '-' : (s.drawdown*100).toFixed(2)+'%'}</div></div>`;
+  document.getElementById('positions').innerHTML = s.positions.length ? s.positions.map(p=>`<tr><td>${p.instrument}</td><td>${p.side}</td><td>${p.units}</td><td>${p.entry_price}</td><td>${p.stop_price}</td><td>${money(p.planned_risk_home)}</td></tr>`).join('') : '<tr><td colspan="6">なし</td></tr>';
+  document.getElementById('events').innerHTML = e.map(x=>`<div class="card"><b>${x.kind}</b> <span class="muted">${x.ts} ${x.instrument||''}</span><pre>${JSON.stringify(x.payload,null,2)}</pre></div>`).join('');
+}
+document.getElementById('run').onclick = async ()=>{
+  const b=document.getElementById('run'); b.disabled=true; b.textContent='実行中…';
+  try { const r=await fetch('/api/run',{method:'POST'}); const j=await r.json(); if(!r.ok) throw new Error(JSON.stringify(j)); }
+  catch(e){ alert(e); } finally { b.disabled=false; b.textContent='今すぐ1回実行'; await refresh(); }
+};
+refresh(); setInterval(refresh, 30000);
+</script>
+</body>
+</html>
