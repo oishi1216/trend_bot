@@ -102,6 +102,18 @@ class Storage:
             result.append(item)
         return result
 
+    def latest_event(self, kind: str) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM events WHERE kind=? ORDER BY id DESC LIMIT 1",
+                (kind,),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["payload"] = json.loads(item["payload"])
+        return item
+
     def get_positions(self) -> list[Position]:
         with self._conn() as conn:
             rows = conn.execute("SELECT * FROM positions ORDER BY instrument").fetchall()

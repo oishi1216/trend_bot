@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 
 from .config import Settings
 from .engine import TradingEngine
+from .feedback import FeedbackService
 from .storage import Storage
 
 settings = Settings.from_env()
@@ -21,6 +22,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 storage = Storage(settings.db_path, settings.paper_initial_balance)
 engine = TradingEngine(settings, storage)
+feedback_service = FeedbackService(settings, storage)
 templates = Jinja2Templates(directory="app/templates")
 run_lock = asyncio.Lock()
 
@@ -29,7 +31,13 @@ async def execute_run(force: bool = False):
     if run_lock.locked():
         raise HTTPException(status_code=409, detail="Engine is already running")
     async with run_lock:
-        return await asyncio.to_thread(engine.run_once, force)
+        summary = await asyncio.to_thread(engine.run_once, force)
+    # Trading has already completed; feedback failure must never affect execution.
+    feedback = await asyncio.to_thread(
+        feedback_service.analyze_run, summary, force=False
+    )
+    summary["openai_feedback"] = feedback
+    return summary
 
 
 async def scheduler_loop() -> None:
@@ -100,3 +108,21 @@ def events(limit: int = Query(default=50, ge=1, le=500)):
 @app.post("/api/run")
 async def run(force: bool = Query(default=False)):
     return await execute_run(force=force)
+
+
+@app.get("/api/feedback/latest")
+def latest_feedback():
+    event = storage.latest_event("openai_feedback")
+    if event is None:
+        raise HTTPException(status_code=404, detail="No OpenAI feedback has been generated")
+    return event
+
+
+@app.post("/api/feedback/run")
+async def run_feedback(force: bool = Query(default=True)):
+    event = storage.latest_event("engine_run")
+    if event is None:
+        raise HTTPException(status_code=404, detail="No engine run report is available")
+    return await asyncio.to_thread(
+        feedback_service.analyze_run, event["payload"], force=force
+    )

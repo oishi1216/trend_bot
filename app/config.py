@@ -51,6 +51,13 @@ class Settings:
     paper_slippage_pips: float
     schedule_hour_utc: int
     schedule_minute_utc: int
+    openai_feedback_enabled: bool
+    openai_feedback_allow_live: bool
+    openai_api_key: str
+    openai_model: str
+    openai_feedback_event_limit: int
+    openai_feedback_min_interval_hours: float
+    openai_timeout_seconds: float
 
     @property
     def oanda_base_url(self) -> str:
@@ -109,4 +116,13 @@ class Settings:
             paper_slippage_pips=_float("PAPER_SLIPPAGE_PIPS", 0.2),
             schedule_hour_utc=_int("SCHEDULE_HOUR_UTC", 22),
             schedule_minute_utc=_int("SCHEDULE_MINUTE_UTC", 15),
+            openai_feedback_enabled=_bool("OPENAI_FEEDBACK_ENABLED", False),
+            openai_feedback_allow_live=_bool("OPENAI_FEEDBACK_ALLOW_LIVE", False),
+            openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip(),
+            openai_feedback_event_limit=_int("OPENAI_FEEDBACK_EVENT_LIMIT", 100),
+            openai_feedback_min_interval_hours=_float(
+                "OPENAI_FEEDBACK_MIN_INTERVAL_HOURS", 20.0
+            ),
+            openai_timeout_seconds=_float("OPENAI_TIMEOUT_SECONDS", 60.0),
         )

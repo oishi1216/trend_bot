@@ -233,3 +233,55 @@ pytest -q
 注文送信後に通信が切れた場合など、実際には約定したのにレスポンスを受け取れない障害を完全には処理していません。また、OANDA JapanのMT5デモ口座を、このPythonアプリへ直接接続する機能はありません。
 
 このリポジトリは、実口座ですぐ稼働させる完成品ではなく、REST APIを利用できる環境で戦略とリスク管理を検証するための出発点です。
+
+---
+
+## OpenAI APIへテスト結果を送る機能
+
+この版には、エンジン実行後の集計結果をOpenAI APIへ送り、構造化された評価結果をSQLiteの`events`テーブルへ保存する機能が含まれます。初期状態では無効です。
+
+### 送信される内容
+
+- 最新の`engine_run`集計
+- 選択された直近の運用イベント
+- 現在の戦略パラメータとリスク上限
+
+APIキー、OANDAアカウントID、認証情報、`raw`ブローカー応答、ブローカー取引IDは送信前に削除またはマスクされます。ただし、ログ設計を変更した場合は送信内容を再確認してください。
+
+### 設定
+
+`.env`へ追加します。
+
+```dotenv
+OPENAI_FEEDBACK_ENABLED=true
+OPENAI_FEEDBACK_ALLOW_LIVE=false
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-5.4-mini
+OPENAI_FEEDBACK_EVENT_LIMIT=100
+OPENAI_FEEDBACK_MIN_INTERVAL_HOURS=20
+OPENAI_TIMEOUT_SECONDS=60
+```
+
+`OPENAI_API_KEY`をGitへコミットしないでください。実口座モードでは`OPENAI_FEEDBACK_ALLOW_LIVE=false`のままにすることを推奨します。
+
+### 実行
+
+通常のエンジン実行後、設定された最小間隔を超えていれば自動的に評価されます。
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/run"
+```
+
+直近のエンジン結果を強制的に再評価する場合：
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/feedback/run?force=true"
+```
+
+最新の評価結果：
+
+```bash
+curl "http://127.0.0.1:8000/api/feedback/latest"
+```
+
+この機能は分析結果を保存するだけで、コード変更、GitHub Push、Pull Request作成、取引パラメータ変更は行いません。それらは次の段階で別ワークフローとして実装してください。
