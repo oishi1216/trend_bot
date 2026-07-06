@@ -3,12 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from .config import Settings
+from .instruments import quote_currency
 from .models import Fill, Position, Side
 from .storage import Storage
 
 
 def pip_size(instrument: str) -> float:
-    return 0.01 if instrument.split("_")[1] == "JPY" else 0.0001
+    return 0.01 if quote_currency(instrument) == "JPY" else 0.0001
 
 
 class PaperBroker:
@@ -25,7 +26,7 @@ class PaperBroker:
         nav = self.storage.paper_balance()
         for position in self.storage.get_positions():
             current = self.market_data.mid_price(position.instrument)
-            quote = position.instrument.split("_")[1]
+            quote = quote_currency(position.instrument)
             quote_to_home = self.market_data.conversion_rate(
                 quote, self.settings.account_home_currency
             )
@@ -92,7 +93,7 @@ class PaperBroker:
         )
 
     def _realize(self, position: Position, exit_price: float, reason: str) -> None:
-        quote = position.instrument.split("_")[1]
+        quote = quote_currency(position.instrument)
         quote_to_home = self.market_data.conversion_rate(
             quote, self.settings.account_home_currency
         )
