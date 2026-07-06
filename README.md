@@ -1,9 +1,9 @@
-# FX Trend Bot — OANDA REST API版MVP
+# FX Trend Bot — OANDA REST API / MT5 paper MVP
 
-日足の低レバレッジ・トレンドフォロー戦略を、Python・FastAPI・OANDA v20 REST APIで評価／執行するためのMVPです。
+日足の低レバレッジ・トレンドフォロー戦略を、Python・FastAPIで評価／ペーパー運用するためのMVPです。
 
-> **重要な訂正（2026-07-04）**  
-> このリポジトリは **MT5用EAではありません**。また、OANDA Japanのデモ口座を作成しただけでは、このアプリに必要なREST APIトークンを利用できるとは限りません。OANDA Japanで今すぐデモ自動売買を始める場合は、まず **MT5＋MQL5 EA** を使う構成が現実的です。
+> **重要**  
+> これは利益保証ソフトではありません。急変、窓開け、通信障害、API障害、スリッページ、価格配信停止などで、予定した損失を超えることがあります。
 
 ## 1. 実装している戦略
 
@@ -16,32 +16,23 @@
 - 8%ドローダウンでリスク半減、12%で新規停止
 - ナンピン、マーチンゲール、損切り拡大なし
 
-> これは利益保証ソフトではありません。急変、窓開け、通信障害、API障害、スリッページ、価格配信停止などで、予定した損失を超えることがあります。
-
 ## 2. OANDA Japanでの位置づけ
 
 OANDA Japanのデモ口座では、FXについてMT5およびfxTrade／TradingViewを利用できます。ただし、次の3つは別物です。
 
 | 種類 | 用途 | このリポジトリからの接続 |
 |---|---|---|
-| MT5デモ口座 | MT5上で裁量取引・EA・ストラテジーテスト | **未対応** |
-| fxTrade／TradingView | チャート分析・手動発注 | **直接接続しない** |
-| OANDA v20 REST API | Pythonなど外部プログラムから価格取得・注文 | **対応対象** |
+| MT5デモ口座 | MT5上で裁量取引・EA・ストラテジーテスト | `mt5_paper`で価格取得のみ対応 |
+| fxTrade／TradingView | チャート分析・手動発注 | 直接接続しない |
+| OANDA v20 REST API | Pythonなど外部プログラムから価格取得・注文 | `paper` / `oanda_practice` / `oanda_live`で対応 |
 
-### MT5のログイン情報はAPI認証情報ではない
+### MT5のログイン情報はREST API認証情報ではない
 
-`OANDA_ACCOUNT_ID` に入力するのは、REST APIで利用可能なv20／fxTrade口座IDです。MT5のログインIDを入力しても接続できません。
+`OANDA_ACCOUNT_ID` に入力するのは、REST APIで利用可能なv20／fxTrade口座IDです。MT5のログインIDを入力してもREST APIには接続できません。
 
 ### OANDA JapanのAPI利用条件
 
-OANDA Japanの公式案内では、REST APIの利用には少なくとも以下が必要です。
-
-- 会員ステータスがGold以上
-- NYサーバーの取引コースがプロコース
-- NYサーバー口座残高が25万円以上
-- API契約への同意とパーソナルトークンの発行
-
-条件や対象口座は変更される可能性があります。利用前に公式ページで最新条件を確認してください。
+OANDA JapanのREST API利用には、会員ステータス、取引コース、口座残高、API契約などの条件があります。利用前に公式ページで最新条件を確認してください。
 
 - [OANDA Japan API案内](https://www.oanda.jp/platform/api)
 - [APIトークンの発行条件と手順](https://www.oanda.jp/lab-education/api/usage/rest_api_activation_procedure/)
@@ -49,25 +40,27 @@ OANDA Japanの公式案内では、REST APIの利用には少なくとも以下�
 
 ## 3. 推奨する進め方
 
-### ルートA：MT5デモで検証する（現在の推奨）
+### ルートA：MT5ペーパーモードで検証する
 
-OANDA Japanのデモ口座を使い、今回の戦略をMQL5のEAとして別途実装します。
+OANDA REST APIが使えない場合は、まず `mt5_paper` を使います。
 
 ```text
 OANDA Japan MT5デモ口座
         ↓
-       MT5
+       MT5端末
         ↓
-    MQL5 EA
+MetaTrader5 Python package
         ↓
-ストラテジーテスター／フォワードテスト
+Python / FastAPI
+        ↓
+SQLiteペーパー売買・OpenAIフィードバック
 ```
 
-このリポジトリにはMQL5 EAは含まれていません。Python版とは別実装が必要です。
+`mt5_paper` は、MT5から日足データと現在価格を取得します。ただし、**MT5へ注文は送りません**。注文・損益・ストップはSQLite内で模擬します。
 
 ### ルートB：REST API版を使う
 
-API利用条件を満たし、OANDAのAPI画面から有効なパーソナルトークンと口座IDを取得できた場合に、このリポジトリを利用します。
+API利用条件を満たし、OANDAのAPI画面から有効なパーソナルトークンと口座IDを取得できた場合に、REST API版を利用します。
 
 ```text
 OANDA v20 REST API
@@ -77,7 +70,7 @@ Python / FastAPI
 SQLite・管理画面
 ```
 
-最初は`paper`モードでシグナルと仮想損益だけを検証し、実注文は送らないでください。
+最初は `paper` モードでシグナルと仮想損益だけを検証し、実注文は送らないでください。
 
 ### ルートC：TradingViewから自動化する
 
@@ -87,7 +80,7 @@ TradingViewとOANDA口座を接続しただけでは、Pine Scriptのストラ�
 TradingViewアラート
         ↓ Webhook
 外部Pythonアプリ
-        ↓ REST API
+        ↓ REST APIまたはMT5
 OANDA
 ```
 
@@ -100,33 +93,43 @@ OANDA
 | OANDA v20 REST APIのローソク足取得 | 実装済み |
 | REST API口座情報・価格取得 | 実装済み |
 | ローカルのペーパートレード | 実装済み |
-| OANDA practice APIへの注文 | 実装済み。ただし対応するpractice認証情報が必要 |
-| OANDA live APIへの注文 | 実装済み。実口座投入前の追加検証が必要 |
-| MT5への接続 | 未実装 |
+| MT5からの日足・現在価格取得 | `mt5_paper`で実装済み |
+| MT5経由のペーパー売買 | 実装済み |
+| MT5への実注文 | 未実装 |
 | MQL5 EA | 未実装 |
 | TradingView Webhook受信 | 未実装 |
 | CSVだけを使うオフラインバックテスト | 未実装 |
 
 ## 5. モードに関する重要事項
 
-`.env`では次の3モードを指定できます。
+`.env`では次の4モードを指定できます。
 
 ```dotenv
-# paper | oanda_practice | oanda_live
-BROKER_MODE=paper
+# paper | mt5_paper | oanda_practice | oanda_live
+BROKER_MODE=mt5_paper
 ```
 
 ### `paper`
 
-注文と損益はSQLite内で模擬します。ただし、現在の実装は価格取得、口座通貨換算、時価評価にOANDA REST APIを使います。
+注文と損益はSQLite内で模擬します。ただし、価格取得、口座通貨換算、時価評価にOANDA REST APIを使います。
 
 そのため、**paperモードでも有効なREST APIの口座IDとトークンが必要です**。MT5デモ口座のログイン情報だけでは動作しません。
+
+### `mt5_paper`
+
+MT5から価格データを取得し、注文と損益はSQLite内で模擬します。
+
+- OANDA REST APIトークンは不要
+- Windows上でOANDA MetaTrader 5を起動しておく必要あり
+- MT5デモ口座へログイン済みである必要あり
+- `TRADING_ARMED=true`にしてもMT5へ実注文は送りません
+- 最新のMT5日足は未確定の可能性があるため、取得後に最後の1本を除外します
 
 ### `oanda_practice`
 
 `https://api-fxpractice.oanda.com`へ注文します。
 
-このモードは、OANDA v20 practice環境用として発行された認証情報がある場合だけ使用してください。**OANDA JapanのMT5デモ口座と同じものではありません**。MT5デモの口座IDやパスワードを設定しても接続できません。
+このモードは、OANDA v20 practice環境用として発行された認証情報がある場合だけ使用してください。**OANDA JapanのMT5デモ口座と同じものではありません**。
 
 ### `oanda_live`
 
@@ -142,11 +145,89 @@ ALLOW_LIVE_TRADING=YES_I_ACCEPT_THE_RISK
 
 十分なバックテスト、フォワードテスト、障害試験を終えるまで解除しないでください。
 
-## 6. REST APIを利用できる場合の起動方法
+## 6. `mt5_paper` の起動方法
 
-APIを利用できない場合は、この章の手順では起動できません。MT5 EA版を用意するか、市場データ取得部分を別のデータソースに置き換える必要があります。
+### 6.1 Python依存関係を入れる
 
-### 6.1 環境ファイルを作る
+通常依存をインストールします。
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+MT5連携を使うWindows環境だけ、追加で次を入れます。
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-mt5.txt
+```
+
+### 6.2 MT5を準備する
+
+1. OANDA MetaTrader 5を起動
+2. OANDA MT5デモ口座へログイン
+3. 気配値に `USDJPY`、`EURUSD`、`GBPUSD`、`AUDUSD` が表示されることを確認
+4. Pythonから `account_info` と日足データが取得できることを確認
+
+### 6.3 `.env` を設定する
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+Windowsローカル実行では、`DB_PATH` とMT5設定を次のようにします。
+
+```dotenv
+DB_PATH=data/fxbot.sqlite3
+BROKER_MODE=mt5_paper
+TRADING_ARMED=false
+
+MT5_TERMINAL_PATH=C:\Program Files\OANDA MetaTrader 5\terminal64.exe
+MT5_INSTRUMENTS=USDJPY,EURUSD,GBPUSD,AUDUSD
+MT5_TIMEOUT_MS=120000
+
+OPENAI_FEEDBACK_ENABLED=true
+OPENAI_FEEDBACK_ALLOW_LIVE=false
+OPENAI_API_KEY=sk-...
+```
+
+`OPENAI_API_KEY`をGitへコミットしないでください。
+
+### 6.4 アプリを起動する
+
+```powershell
+New-Item -ItemType Directory -Force .\data | Out-Null
+.\.venv\Scripts\python.exe -m uvicorn app.main:app `
+  --host 127.0.0.1 `
+  --port 8000 `
+  --env-file .env
+```
+
+ブラウザーで次を開きます。
+
+```text
+http://127.0.0.1:8000
+```
+
+別PowerShellから実行します。
+
+```powershell
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/api/run?force=true"
+```
+
+イベント確認：
+
+```powershell
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8000/api/events?limit=20"
+```
+
+## 7. REST APIを利用できる場合の起動方法
+
+APIを利用できない場合は、この章の手順では起動できません。`mt5_paper`を使うか、市場データ取得部分を別のデータソースに置き換える必要があります。
+
+### 7.1 環境ファイルを作る
 
 ```bash
 cp .env.example .env
@@ -167,7 +248,7 @@ OANDA_API_TOKEN=...
 ACCOUNT_HOME_CURRENCY=JPY
 ```
 
-### 6.2 Dockerで起動する
+### 7.2 Dockerで起動する
 
 ```bash
 docker compose up --build -d
@@ -181,31 +262,31 @@ http://127.0.0.1:8000
 
 最初は`TRADING_ARMED=false`のまま実行し、シグナルとエラーだけ確認してください。
 
-### 6.3 手動実行する
+## 8. 実行タイミング
 
-```bash
-curl -X POST http://127.0.0.1:8000/api/run
-```
+月曜〜金曜の22:15 UTC以降に1日1回、自動実行します。OANDA REST APIの日足は`America/New_York`の17時で揃え、未完成足を除外します。MT5日足は保守的に最後の1本を除外します。同じ完成足はSQLiteで重複処理しません。
 
-`force=true`は同じ足を再評価する開発用オプションです。注文重複の原因になり得るため、本番では使用しないでください。
+日本では米国の夏時間によって実行時刻の見え方が変わります。ホストの時刻とタイムゾーン設定も確認してください。
 
-## 7. 実行タイミング
-
-月曜〜金曜の22:15 UTC以降に1日1回、自動実行します。OANDAの日足は`America/New_York`の17時で揃え、未完成足を除外します。同じ完成足はSQLiteで重複処理しません。
-
-日本では米国の夏時間によって実行時刻の見え方が変わります。Dockerホストの時刻とタイムゾーン設定も確認してください。
-
-## 8. 安全設計
+## 9. 安全設計
 
 - 新規注文は`TRADING_ARMED`で停止可能。既存ポジションの出口判定は継続します。
+- `mt5_paper`はMT5へ実注文を送りません。
 - liveモードでは追加の文字列ロックがあります。
 - OANDA側に存在し、ローカルDBにないポジションを検出すると、その通貨の新規注文をブロックします。
 - ローカルポジションがOANDA側から消えた場合、ブローカー側ストップ等で閉じた可能性があるとして警告を記録します。
-- Web画面に認証機能はありません。Docker Composeはlocalhostだけに公開します。外部公開しないでください。
-- APIトークンをGitへコミットしないでください。
+- Web画面に認証機能はありません。外部公開しないでください。
+- APIトークンやMT5パスワードをGitへコミットしないでください。
 - MT5による手動取引や別EAと同じ口座を混在させないでください。
 
-## 9. テスト
+## 10. テスト
+
+```powershell
+$env:PYTHONPATH="."
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Linux/macOSや通常CIでは、MT5追加依存を入れずに通常テストだけ実行できます。
 
 ```bash
 python -m venv .venv
@@ -214,31 +295,9 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-## 10. 本番化前に追加すべきもの
+## 11. OpenAI APIへテスト結果を送る機能
 
-1. 15年以上・4通貨合算のバックテストとウォークフォワード検証
-2. スプレッド、日次スワップ、週末ギャップ、注文拒否を含むシミュレーション
-3. Slack／メール通知、死活監視、ログ集中管理
-4. ブローカー取引履歴を使った完全なポジション照合
-5. API再試行の冪等性キーと注文重複防止
-6. DBバックアップ、秘密情報管理、アクセス認証
-7. ブローカーごとの最小取引単位・価格精度・ストップ最小距離の取得と検証
-8. OANDA Japan口座でのエンドポイント、口座ID形式、注文仕様の実地確認
-9. MT5を使う場合は、同等ロジックのMQL5 EAとストラテジーテスト
-
-## 11. 重要な実装上の注意
-
-このMVPのローカルDBは「この戦略が建てたポジション」の台帳です。手動売買や別のEAと同じ口座を混在させないでください。
-
-注文送信後に通信が切れた場合など、実際には約定したのにレスポンスを受け取れない障害を完全には処理していません。また、OANDA JapanのMT5デモ口座を、このPythonアプリへ直接接続する機能はありません。
-
-このリポジトリは、実口座ですぐ稼働させる完成品ではなく、REST APIを利用できる環境で戦略とリスク管理を検証するための出発点です。
-
----
-
-## OpenAI APIへテスト結果を送る機能
-
-この版には、エンジン実行後の集計結果をOpenAI APIへ送り、構造化された評価結果をSQLiteの`events`テーブルへ保存する機能が含まれます。初期状態では無効です。
+エンジン実行後の集計結果をOpenAI APIへ送り、構造化された評価結果をSQLiteの`events`テーブルへ保存する機能が含まれます。初期状態では無効です。
 
 ### 送信される内容
 
@@ -284,4 +343,24 @@ curl -X POST "http://127.0.0.1:8000/api/feedback/run?force=true"
 curl "http://127.0.0.1:8000/api/feedback/latest"
 ```
 
-この機能は分析結果を保存するだけで、コード変更、GitHub Push、Pull Request作成、取引パラメータ変更は行いません。それらは次の段階で別ワークフローとして実装してください。
+この機能は分析結果を保存するだけで、コード変更、GitHub Push、Pull Request作成、取引パラメータ変更は行いません。それらは別ワークフローとして実装してください。
+
+## 12. 本番化前に追加すべきもの
+
+1. 15年以上・4通貨合算のバックテストとウォークフォワード検証
+2. スプレッド、日次スワップ、週末ギャップ、注文拒否を含むシミュレーション
+3. Slack／メール通知、死活監視、ログ集中管理
+4. ブローカー取引履歴を使った完全なポジション照合
+5. API再試行の冪等性キーと注文重複防止
+6. DBバックアップ、秘密情報管理、アクセス認証
+7. ブローカーごとの最小取引単位・価格精度・ストップ最小距離の取得と検証
+8. OANDA Japan口座でのエンドポイント、口座ID形式、注文仕様の実地確認
+9. MT5で実注文を使う場合は、別途`mt5_demo`またはMQL5 EAとして実装し、十分に検証
+
+## 13. 重要な実装上の注意
+
+このMVPのローカルDBは「この戦略が建てたポジション」の台帳です。手動売買や別のEAと同じ口座を混在させないでください。
+
+`mt5_paper`は実注文を送りませんが、MT5端末から取得した価格データに依存します。MT5端末の未起動、未ログイン、銘柄未表示、通信断では実行に失敗します。
+
+このリポジトリは、実口座ですぐ稼働させる完成品ではなく、戦略とリスク管理を検証するための出発点です。
