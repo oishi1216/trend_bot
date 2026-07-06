@@ -7,6 +7,7 @@ import httpx
 import pandas as pd
 
 from .config import Settings
+from .instruments import quote_currency
 from .models import Fill, Side
 
 logger = logging.getLogger(__name__)
@@ -112,8 +113,7 @@ class OandaClient:
 
     @staticmethod
     def _format_price(instrument: str, value: float) -> str:
-        quote = instrument.split("_")[1]
-        decimals = 3 if quote == "JPY" else 5
+        decimals = 3 if quote_currency(instrument) == "JPY" else 5
         return f"{value:.{decimals}f}"
 
     def market_order(

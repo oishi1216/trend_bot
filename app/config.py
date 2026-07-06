@@ -19,6 +19,14 @@ def _int(name: str, default: int) -> int:
     return int(os.getenv(name, str(default)))
 
 
+def _tuple_env(name: str, default: str) -> tuple[str, ...]:
+    return tuple(
+        item.strip().upper()
+        for item in os.getenv(name, default).split(",")
+        if item.strip()
+    )
+
+
 @dataclass(frozen=True)
 class Settings:
     app_name: str
@@ -58,6 +66,8 @@ class Settings:
     openai_feedback_event_limit: int
     openai_feedback_min_interval_hours: float
     openai_timeout_seconds: float
+    mt5_terminal_path: str
+    mt5_timeout_ms: int
 
     @property
     def oanda_base_url(self) -> str:
@@ -71,16 +81,17 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        instruments = tuple(
-            item.strip().upper()
-            for item in os.getenv(
-                "INSTRUMENTS", "USD_JPY,EUR_USD,GBP_USD,AUD_USD"
-            ).split(",")
-            if item.strip()
-        )
         mode = os.getenv("BROKER_MODE", "paper").strip().lower()
-        if mode not in {"paper", "oanda_practice", "oanda_live"}:
-            raise ValueError("BROKER_MODE must be paper, oanda_practice, or oanda_live")
+        if mode not in {"paper", "mt5_paper", "oanda_practice", "oanda_live"}:
+            raise ValueError(
+                "BROKER_MODE must be paper, mt5_paper, oanda_practice, or oanda_live"
+            )
+
+        if mode == "mt5_paper":
+            instruments = _tuple_env("MT5_INSTRUMENTS", "USDJPY,EURUSD,GBPUSD,AUDUSD")
+        else:
+            instruments = _tuple_env("INSTRUMENTS", "USD_JPY,EUR_USD,GBP_USD,AUD_USD")
+
         return cls(
             app_name=os.getenv("APP_NAME", "FX Trend Bot"),
             db_path=os.getenv("DB_PATH", "data/fxbot.sqlite3"),
@@ -125,4 +136,6 @@ class Settings:
                 "OPENAI_FEEDBACK_MIN_INTERVAL_HOURS", 20.0
             ),
             openai_timeout_seconds=_float("OPENAI_TIMEOUT_SECONDS", 60.0),
+            mt5_terminal_path=os.getenv("MT5_TERMINAL_PATH", "").strip(),
+            mt5_timeout_ms=_int("MT5_TIMEOUT_MS", 120000),
         )

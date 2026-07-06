@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import Settings
+from .instruments import quote_currency
 from .models import Position
+from .mt5_client import Mt5Client
 from .oanda import OandaClient
 from .paper import PaperBroker
 from .risk import calculate_units
@@ -20,7 +22,11 @@ class TradingEngine:
         self.settings = settings
         self.storage = storage
         self.oanda = OandaClient(settings)
-        self.paper = PaperBroker(settings, storage, self.oanda)
+        self.market_data = Mt5Client(settings) if settings.broker_mode == "mt5_paper" else self.oanda
+        self.paper = PaperBroker(settings, storage, self.market_data)
+
+    def _is_paper_mode(self) -> bool:
+        return self.settings.broker_mode in {"paper", "mt5_paper"}
 
     def _entries_enabled(self) -> tuple[bool, str]:
         if not self.settings.trading_armed:
@@ -30,7 +36,7 @@ class TradingEngine:
         return True, "armed"
 
     def nav(self) -> float:
-        if self.settings.broker_mode == "paper":
+        if self._is_paper_mode():
             return self.paper.nav()
         return self.oanda.nav()
 
@@ -45,16 +51,16 @@ class TradingEngine:
         planned_risk = sum(p.planned_risk_home for p in self.storage.get_positions())
         gross = 0.0
         for position in self.storage.get_positions():
-            quote = position.instrument.split("_")[1]
-            quote_to_home = self.oanda.conversion_rate(
+            quote = quote_currency(position.instrument)
+            quote_to_home = self.market_data.conversion_rate(
                 quote, self.settings.account_home_currency
             )
-            current_price = self.oanda.mid_price(position.instrument)
+            current_price = self.market_data.mid_price(position.instrument)
             gross += position.units * current_price * quote_to_home
         return planned_risk, gross
 
     def reconcile(self) -> None:
-        if self.settings.broker_mode == "paper":
+        if self._is_paper_mode():
             return
         remote = self.oanda.open_positions()
         local = {p.instrument: p for p in self.storage.get_positions()}
@@ -108,7 +114,7 @@ class TradingEngine:
 
         for instrument in self.settings.instruments:
             try:
-                candles = self.oanda.candles(instrument)
+                candles = self.market_data.candles(instrument)
                 candle = candles.iloc[-1].to_dict()
                 candle_time = str(candle["time"])
                 if self.storage.is_processed(instrument, candle_time) and not force:
@@ -118,7 +124,7 @@ class TradingEngine:
                 position = self.storage.get_position(instrument)
 
                 # Paper hard stop is simulated using the completed day's OHLC before close-based rules.
-                if self.settings.broker_mode == "paper" and position:
+                if self._is_paper_mode() and position:
                     stop_fill = self.paper.process_stop(position, candle)
                     if stop_fill:
                         self.storage.delete_position(instrument)
@@ -135,7 +141,7 @@ class TradingEngine:
                 }
 
                 if position and decision.action == "exit":
-                    if self.settings.broker_mode == "paper":
+                    if self._is_paper_mode():
                         fill = self.paper.close_position(position, decision.reason)
                     else:
                         fill = self.oanda.close_position(instrument, position.side)
@@ -149,7 +155,7 @@ class TradingEngine:
                     result["fill_price"] = fill.price
 
                 elif not position and decision.action in {"enter_long", "enter_short"}:
-                    remote = self.oanda.open_positions() if self.settings.broker_mode != "paper" else {}
+                    remote = {} if self._is_paper_mode() else self.oanda.open_positions()
                     if instrument in remote:
                         result["status"] = "blocked_untracked_remote_position"
                     elif not entries_enabled:
@@ -158,14 +164,14 @@ class TradingEngine:
                         result["status"] = "entry_blocked: 12% drawdown circuit breaker"
                     else:
                         side = "long" if decision.action == "enter_long" else "short"
-                        entry_reference = self.oanda.mid_price(instrument)
+                        entry_reference = self.market_data.mid_price(instrument)
                         stop_price = (
                             entry_reference - self.settings.atr_stop_multiple * decision.atr
                             if side == "long"
                             else entry_reference + self.settings.atr_stop_multiple * decision.atr
                         )
-                        quote = instrument.split("_")[1]
-                        quote_to_home = self.oanda.conversion_rate(
+                        quote = quote_currency(instrument)
+                        quote_to_home = self.market_data.conversion_rate(
                             quote, self.settings.account_home_currency
                         )
                         planned_risk, gross = self._portfolio_metrics()
@@ -185,7 +191,7 @@ class TradingEngine:
                         else:
                             fill = (
                                 self.paper.market_order(instrument, side, size.units, stop_price)
-                                if self.settings.broker_mode == "paper"
+                                if self._is_paper_mode()
                                 else self.oanda.market_order(instrument, side, size.units, stop_price)
                             )
                             actual_risk = abs(fill.price - stop_price) * fill.units * quote_to_home
