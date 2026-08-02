@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Literal
+from dataclasses import asdict, dataclass, field
+from typing import Any, Literal
 
 
 Side = Literal["long", "short"]
@@ -31,6 +31,13 @@ class StrategyDecision:
     atr: float
     ema: float
     reason: str
+    score: float = 0.0
+    regime: str = "legacy"
+    entry_kind: str | None = None
+    stop_atr_multiple: float | None = None
+    risk_fraction: float | None = None
+    updated_stop_price: float | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
