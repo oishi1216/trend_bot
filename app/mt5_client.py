@@ -6,6 +6,7 @@ from typing import Any
 import pandas as pd
 
 from .config import Settings
+from .instruments import quote_currency
 
 
 class Mt5Error(RuntimeError):
@@ -52,7 +53,8 @@ class Mt5Client:
             )
         return pd.DataFrame(rows)
 
-    def candles(self, instrument: str, count: int = 320) -> pd.DataFrame:
+    def candles(self, instrument: str, count: int | None = None) -> pd.DataFrame:
+        requested = count or self.settings.market_data_candle_count
         mt5 = self.connect()
         try:
             if not mt5.symbol_select(instrument, True):
@@ -64,7 +66,7 @@ class Mt5Client:
                 instrument,
                 mt5.TIMEFRAME_D1,
                 0,
-                count + 1,
+                requested + 1,
             )
             if rates is None:
                 raise Mt5Error(
@@ -78,7 +80,7 @@ class Mt5Client:
         finally:
             mt5.shutdown()
 
-    def mid_price(self, instrument: str) -> float:
+    def _tick(self, instrument: str):
         mt5 = self.connect()
         try:
             if not mt5.symbol_select(instrument, True):
@@ -87,14 +89,27 @@ class Mt5Client:
                 )
             tick = mt5.symbol_info_tick(instrument)
             if tick is None:
-                raise Mt5Error(f"MT5 tick not available for {instrument}: {mt5.last_error()}")
+                raise Mt5Error(
+                    f"MT5 tick not available for {instrument}: {mt5.last_error()}"
+                )
             bid = float(tick.bid)
             ask = float(tick.ask)
-            if bid <= 0 or ask <= 0:
-                raise Mt5Error(f"Invalid MT5 bid/ask for {instrument}: bid={bid}, ask={ask}")
-            return (bid + ask) / 2.0
+            if bid <= 0 or ask <= 0 or ask < bid:
+                raise Mt5Error(
+                    f"Invalid MT5 bid/ask for {instrument}: bid={bid}, ask={ask}"
+                )
+            return bid, ask
         finally:
             mt5.shutdown()
+
+    def mid_price(self, instrument: str) -> float:
+        bid, ask = self._tick(instrument)
+        return (bid + ask) / 2.0
+
+    def spread_pips(self, instrument: str) -> float:
+        bid, ask = self._tick(instrument)
+        pip = 0.01 if quote_currency(instrument) == "JPY" else 0.0001
+        return (ask - bid) / pip
 
     def conversion_rate(self, from_currency: str, to_currency: str) -> float:
         from_currency = from_currency.upper()
