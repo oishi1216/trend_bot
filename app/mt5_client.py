@@ -109,7 +109,8 @@ class Mt5Client:
     def spread_pips(self, instrument: str) -> float:
         bid, ask = self._tick(instrument)
         pip = 0.01 if quote_currency(instrument) == "JPY" else 0.0001
-        return (ask - bid) / pip
+        # Normalize binary floating-point noise before threshold comparisons/logging.
+        return round((ask - bid) / pip, 10)
 
     def conversion_rate(self, from_currency: str, to_currency: str) -> float:
         from_currency = from_currency.upper()
