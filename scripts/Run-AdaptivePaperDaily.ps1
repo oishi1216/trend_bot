@@ -18,7 +18,11 @@ $hasLock = $false
 New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
 
 function Write-TaskLog {
-    param([Parameter(Mandatory = $true)][string]$Message)
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Message
+    )
 
     $Message | Out-File -FilePath $logPath -Encoding utf8 -Append
 }
