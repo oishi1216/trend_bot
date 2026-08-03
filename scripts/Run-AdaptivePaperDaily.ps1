@@ -35,7 +35,7 @@ function Get-DotEnvValue {
 
     $pattern = "^\s*" + [regex]::Escape($Name) + "\s*=\s*(.*)$"
     $value = $null
-    foreach ($line in Get-Content -LiteralPath $Path) {
+    foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {
         if ($line -match $pattern) {
             $value = $Matches[1].Trim()
         }
@@ -45,9 +45,11 @@ function Get-DotEnvValue {
         return $null
     }
 
+    $doubleQuote = [string][char]34
+    $singleQuote = [string][char]39
     if (
-        ($value.StartsWith('"') -and $value.EndsWith('"')) -or
-        ($value.StartsWith("'") -and $value.EndsWith("'"))
+        ($value.StartsWith($doubleQuote) -and $value.EndsWith($doubleQuote)) -or
+        ($value.StartsWith($singleQuote) -and $value.EndsWith($singleQuote))
     ) {
         $value = $value.Substring(1, $value.Length - 2)
     }
