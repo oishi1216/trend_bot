@@ -4,6 +4,7 @@ $projectPath = "C:\Users\abdaq\trend_bot"
 $pythonPath = Join-Path $projectPath ".venv\Scripts\python.exe"
 $runnerPath = Join-Path $projectPath "scripts\run_adaptive_paper_daily.py"
 $mt5Path = "C:\Program Files\OANDA MetaTrader 5\terminal64.exe"
+$dotenvPath = Join-Path $projectPath ".env"
 $logDirectory = Join-Path $projectPath "data\task_logs"
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 $logPath = Join-Path $logDirectory "adaptive_paper_daily_$timestamp.log"
@@ -20,6 +21,38 @@ function Write-TaskLog {
     param([Parameter(Mandatory = $true)][string]$Message)
 
     $Message | Out-File -FilePath $logPath -Encoding utf8 -Append
+}
+
+function Get-DotEnvValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    $pattern = "^\s*" + [regex]::Escape($Name) + "\s*=\s*(.*)$"
+    $value = $null
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        if ($line -match $pattern) {
+            $value = $Matches[1].Trim()
+        }
+    }
+
+    if ($null -eq $value) {
+        return $null
+    }
+
+    if (
+        ($value.StartsWith('"') -and $value.EndsWith('"')) -or
+        ($value.StartsWith("'") -and $value.EndsWith("'"))
+    ) {
+        $value = $value.Substring(1, $value.Length - 2)
+    }
+
+    return $value
 }
 
 Write-TaskLog "=== ADAPTIVE PAPER WINDOWS TASK ==="
@@ -70,6 +103,13 @@ try {
 
     Write-TaskLog "branch=$branch"
 
+    $blockedCurrencies = Get-DotEnvValue `
+        -Path $dotenvPath `
+        -Name "ENTRY_BLOCKED_CURRENCIES"
+    if ($null -eq $blockedCurrencies) {
+        $blockedCurrencies = ""
+    }
+
     $env:PYTHONPATH = "."
     $env:DB_PATH = "data/adaptive_paper.sqlite3"
     $env:BROKER_MODE = "mt5_paper"
@@ -78,7 +118,7 @@ try {
     $env:MARKET_DATA_CANDLE_COUNT = "3200"
     $env:MT5_INSTRUMENTS = "USDJPY,EURUSD,GBPUSD,AUDUSD,NZDUSD,USDCAD,USDCHF,EURJPY,GBPJPY,AUDJPY"
     $env:MT5_TERMINAL_PATH = $mt5Path
-    $env:ENTRY_BLOCKED_CURRENCIES = ""
+    $env:ENTRY_BLOCKED_CURRENCIES = $blockedCurrencies
     $env:OPENAI_FEEDBACK_ENABLED = "false"
     $env:PAPER_INITIAL_BALANCE = "1000000"
     $env:ADAPTIVE_DAILY_JSON_PATH = $jsonPath
@@ -86,6 +126,7 @@ try {
     Write-TaskLog "mode=$env:BROKER_MODE"
     Write-TaskLog "profile=$env:STRATEGY_PROFILE"
     Write-TaskLog "database=$env:DB_PATH"
+    Write-TaskLog "entry_blocked_currencies=$env:ENTRY_BLOCKED_CURRENCIES"
     Write-TaskLog "trading_armed_for_paper_run=$env:TRADING_ARMED"
     Write-TaskLog ""
 
