@@ -28,6 +28,23 @@ The registration script performs these checks before registering the task:
 
 The verification run is safe because the strategy is restricted to `mt5_paper` and uses the dedicated paper database.
 
+## Important-event currency blocks
+
+The scheduled runner reads `ENTRY_BLOCKED_CURRENCIES` from the project `.env` file on every run.
+Set currencies before major CPI, employment, GDP, or central-bank events:
+
+```dotenv
+ENTRY_BLOCKED_CURRENCIES=USD,JPY
+```
+
+Clear the block after the event:
+
+```dotenv
+ENTRY_BLOCKED_CURRENCIES=
+```
+
+The value used by each run is written into the task log.
+
 ## View status and latest log
 
 ```powershell
