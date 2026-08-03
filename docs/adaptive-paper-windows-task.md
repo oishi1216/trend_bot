@@ -15,16 +15,26 @@ Run from Windows PowerShell 5.1:
 
 ```powershell
 cd C:\Users\abdaq\trend_bot
-git pull
+git pull --ff-only
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\Register-AdaptivePaperDailyTask.ps1 -RunNow
 ```
 
 The registration script performs these checks before registering the task:
 
-- UTF-8 BOM is applied to generated PowerShell scripts
-- PowerShell Parser validation passes
-- Python daily runner compiles
+- tracked PowerShell source files pass Parser validation without being modified
+- a scheduler-only runtime copy is generated under `data/task_runtime`
+- the generated runtime `.ps1` is saved with UTF-8 BOM
+- the generated runtime `.ps1` passes PowerShell Parser validation
+- the Python daily runner compiles
 - required project, Python, runner, and MT5 paths exist
+
+The scheduled task points to:
+
+```text
+data/task_runtime/Run-AdaptivePaperDaily.ps1
+```
+
+This avoids changing Git-tracked source files during task registration.
 
 The verification run is safe because the strategy is restricted to `mt5_paper` and uses the dedicated paper database.
 
@@ -88,4 +98,4 @@ Timestamped logs older than 90 days are deleted automatically.
 Unregister-ScheduledTask -TaskName "FX Adaptive Paper Daily" -Confirm:$false
 ```
 
-Removing the task does not delete the paper database or logs.
+Removing the task does not delete the paper database, runtime copy, or logs.
