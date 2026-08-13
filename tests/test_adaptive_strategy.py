@@ -15,6 +15,7 @@ def adaptive_settings():
         adaptive_mid_ema_days=40,
         adaptive_fast_ema_days=15,
         adaptive_slope_lookback=8,
+        adaptive_strength_gap_min=0.3,
         adaptive_score_min=70.0,
         adaptive_score_medium=80.0,
         adaptive_score_high=90.0,
@@ -70,9 +71,19 @@ def test_adaptive_blocks_weak_cross_currency_alignment():
         trend_candles(1),
         adaptive_settings(),
         None,
-        pair_strength_gap=-1.0,
+        pair_strength_gap=-0.29,
     )
     assert decision.action == "none"
+
+
+def test_adaptive_allows_strength_gap_at_new_threshold():
+    decision = decide(
+        trend_candles(1),
+        adaptive_settings(),
+        None,
+        pair_strength_gap=0.3,
+    )
+    assert decision.action == "enter_long"
 
 
 def test_currency_strength_aggregates_base_and_quote():

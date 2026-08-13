@@ -400,11 +400,16 @@ def decide(
 
     if is_trend:
         regime = "trend"
+        strength_gap_ok = abs(pair_strength_gap) >= settings.adaptive_strength_gap_min
         long_alignment = (
-            ema_fast > ema_mid > ema_slow and pair_strength_gap > 0
+            strength_gap_ok
+            and ema_fast > ema_mid > ema_slow
+            and pair_strength_gap > 0
         )
         short_alignment = (
-            ema_fast < ema_mid < ema_slow and pair_strength_gap < 0
+            strength_gap_ok
+            and ema_fast < ema_mid < ema_slow
+            and pair_strength_gap < 0
         )
         long_breakout = (
             long_alignment and close > float(row["breakout_high"])

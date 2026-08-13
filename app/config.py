@@ -67,6 +67,7 @@ class Settings:
     adaptive_breakout_days: int
     adaptive_bollinger_days: int
     adaptive_range_z: float
+    adaptive_strength_gap_min: float
     adaptive_score_min: float
     adaptive_score_medium: float
     adaptive_score_high: float
@@ -194,6 +195,9 @@ class Settings:
             adaptive_breakout_days=_int("ADAPTIVE_BREAKOUT_DAYS", 20),
             adaptive_bollinger_days=_int("ADAPTIVE_BOLLINGER_DAYS", 20),
             adaptive_range_z=_float("ADAPTIVE_RANGE_Z", 1.8),
+            adaptive_strength_gap_min=_float(
+                "ADAPTIVE_STRENGTH_GAP_MIN", 0.3
+            ),
             adaptive_score_min=_float("ADAPTIVE_SCORE_MIN", 75.0),
             adaptive_score_medium=_float("ADAPTIVE_SCORE_MEDIUM", 82.0),
             adaptive_score_high=_float("ADAPTIVE_SCORE_HIGH", 90.0),
