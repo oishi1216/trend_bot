@@ -1,87 +1,253 @@
 from __future__ import annotations
 
+import argparse
+import json
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from statistics import mean
-import csv
-import json
-from typing import Any
+from typing import Any, Callable, Mapping
+
+import pandas as pd
+
+from .adaptive_strategy import currency_strength_scores, decide, strength_gap
+from .config import Settings
+from .instruments import quote_currency
+from .models import Position
+
+# Stage 1 explicit transaction-cost assumptions (round-trip cost is split
+# across entry/exit fills, mirroring app.paper.PaperBroker._adverse_cost).
+DEFAULT_SPREAD_PIPS = 1.0
+DEFAULT_SLIPPAGE_PIPS = 0.3
+HIGH_COST_SPREAD_PIPS = 3.0
+HIGH_COST_SLIPPAGE_PIPS = 0.6
+
+_PIP_JPY = 0.01
+_PIP_DEFAULT = 0.0001
 
 
-@dataclass(frozen=True)
-class Bar:
-    date: date
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-    value: float
+def _pip_size(instrument: str) -> float:
+    return _PIP_JPY if quote_currency(instrument) == "JPY" else _PIP_DEFAULT
 
 
-@dataclass(frozen=True)
-class StrategySpec:
-    name: str
-    hold_days: int
-    entry_rank_band: float
-    exit_rule: str
+def _adverse_cost(instrument: str, spread_pips: float, slippage_pips: float) -> float:
+    return _pip_size(instrument) * (spread_pips / 2 + slippage_pips)
 
 
-STRATEGIES = {
-    "A Event": StrategySpec("A Event", 5, 0.10, "event"),
-    "B Momentum": StrategySpec("B Momentum", 20, 0.20, "momentum"),
-    "C Pullback": StrategySpec("C Pullback", 5, 0.30, "pullback"),
-}
+@dataclass
+class _OpenTrade:
+    instrument: str
+    side: str
+    entry_price: float
+    stop_price: float
+    initial_stop_price: float
+    opened_at: str
+    regime: str
+    entry_kind: str | None
+    score: float
+    risk_fraction: float
+    risk_dollars: float
+    price_per_risk_unit: float
 
 
-def load_universe(data_dir: str | Path) -> dict[str, list[Bar]]:
-    root = Path(data_dir)
-    universe: dict[str, list[Bar]] = {}
-    for path in sorted(root.glob("*.csv")):
-        rows: list[Bar] = []
-        with path.open("r", encoding="utf-8-sig", newline="") as f:
-            for row in csv.DictReader(f):
-                rows.append(
-                    Bar(
-                        date=datetime.strptime(row["date"], "%Y-%m-%d").date(),
-                        open=float(row["open"]),
-                        high=float(row["high"]),
-                        low=float(row["low"]),
-                        close=float(row["close"]),
-                        volume=float(row.get("volume") or 0),
-                        value=float(row.get("value") or 0),
-                    )
-                )
-        if rows:
-            universe[path.stem] = rows
-    return universe
+def _common_dates(candles_by_instrument: Mapping[str, pd.DataFrame]) -> list[str]:
+    sets = [
+        set(df["time"].astype(str)) for df in candles_by_instrument.values() if len(df)
+    ]
+    if not sets:
+        return []
+    common = set.intersection(*sets)
+    return sorted(common)
 
 
-def _sma(values) -> float:
-    values = list(values)
-    return mean(values) if values else 0.0
+def _simulate(
+    candles_by_instrument: Mapping[str, pd.DataFrame],
+    settings: Settings,
+    *,
+    initial_equity: float,
+    spread_pips: float,
+    slippage_pips: float,
+) -> dict[str, Any]:
+    """Replay bars chronologically and reuse app.adaptive_strategy.decide as-is.
 
+    No-lookahead guarantee: at each simulated date `t`, every instrument's
+    dataframe is freshly sliced to rows with time <= t before being handed to
+    `decide()`/`currency_strength_scores()`. Nothing beyond `t` is ever
+    constructed or read, so a decision at `t` cannot be influenced by bars
+    that have not "happened" yet in the replay.
+    """
+    dates = _common_dates(candles_by_instrument)
+    sorted_frames = {
+        instrument: df.sort_values("time").reset_index(drop=True)
+        for instrument, df in candles_by_instrument.items()
+    }
 
-def _ret(a: float, b: float) -> float:
-    return 0.0 if a <= 0 else b / a - 1.0
+    equity = float(initial_equity)
+    equity_curve: list[float] = []
+    equity_dates: list[str] = []
+    trades: list[dict[str, Any]] = []
+    open_trades: dict[str, _OpenTrade] = {}
 
-
-def _atr(bars: list[Bar], idx: int, days: int = 20) -> float:
-    start = max(1, idx - days + 1)
-    trs = []
-    prev = bars[start - 1].close
-    for bar in bars[start : idx + 1]:
-        trs.append(
-            max(bar.high - bar.low, abs(bar.high - prev), abs(bar.low - prev))
+    def _close_trade(instrument: str, fill: float, current_date: str, reason: str) -> None:
+        nonlocal equity
+        trade = open_trades.pop(instrument)
+        direction = 1 if trade.side == "long" else -1
+        pnl = (fill - trade.entry_price) * direction * trade.price_per_risk_unit
+        equity += pnl
+        trades.append(
+            {
+                "instrument": instrument,
+                "side": trade.side,
+                "regime": trade.regime,
+                "entry_kind": trade.entry_kind,
+                "score": trade.score,
+                "entry_date": trade.opened_at,
+                "exit_date": current_date,
+                "entry_price": trade.entry_price,
+                "exit_price": fill,
+                "pnl": pnl,
+                "r": pnl / trade.risk_dollars if trade.risk_dollars else 0.0,
+                "exit_reason": reason,
+            }
         )
-        prev = bar.close
-    return _sma(trs)
+        equity_curve.append(equity)
+        equity_dates.append(current_date)
 
+    for current_date in dates:
+        slices: dict[str, pd.DataFrame] = {}
+        for instrument, df in sorted_frames.items():
+            sliced = df[df["time"] <= current_date]
+            if sliced.empty:
+                continue
+            slices[instrument] = sliced
+        if not slices:
+            continue
 
-def _avg_value(bars: list[Bar], idx: int, days: int = 20) -> float:
-    return _sma(bar.value for bar in bars[max(0, idx - days + 1) : idx + 1])
+        strengths = currency_strength_scores(slices, settings)
+        candidates: list[tuple[str, Any]] = []
+
+        for instrument, sliced in slices.items():
+            row = sliced.iloc[-1]
+            if str(row["time"]) != current_date:
+                continue
+
+            stopped_today = False
+            trade = open_trades.get(instrument)
+            if trade is not None:
+                low = float(row["low"])
+                high = float(row["high"])
+                open_price = float(row["open"])
+                cost = _adverse_cost(instrument, spread_pips, slippage_pips)
+                fill = None
+                if trade.side == "long" and low <= trade.stop_price:
+                    fill = min(trade.stop_price, open_price) - cost
+                elif trade.side == "short" and high >= trade.stop_price:
+                    fill = max(trade.stop_price, open_price) + cost
+                if fill is not None:
+                    _close_trade(instrument, fill, current_date, "hard_stop")
+                    stopped_today = True
+
+            trade = open_trades.get(instrument)
+            position = None
+            metadata = None
+            if trade is not None:
+                position = Position(
+                    instrument=instrument,
+                    side=trade.side,
+                    units=1,
+                    entry_price=trade.entry_price,
+                    stop_price=trade.stop_price,
+                    opened_at=trade.opened_at,
+                    planned_risk_home=0.0,
+                )
+                metadata = {
+                    "regime": trade.regime,
+                    "entry_kind": trade.entry_kind,
+                    "initial_stop_price": trade.initial_stop_price,
+                    "opened_candle_time": trade.opened_at,
+                    "score": trade.score,
+                    "risk_fraction": trade.risk_fraction,
+                }
+
+            try:
+                decision = decide(
+                    sliced,
+                    settings,
+                    position,
+                    pair_strength_gap=strength_gap(instrument, strengths),
+                    position_metadata=metadata,
+                )
+            except ValueError:
+                # Not enough warm-up bars yet for this instrument; skip.
+                continue
+
+            if position is not None:
+                if decision.updated_stop_price is not None:
+                    tighter = (
+                        decision.updated_stop_price > trade.stop_price
+                        if trade.side == "long"
+                        else decision.updated_stop_price < trade.stop_price
+                    )
+                    if tighter:
+                        trade.stop_price = float(decision.updated_stop_price)
+
+                if decision.action == "exit":
+                    close = float(row["close"])
+                    cost = _adverse_cost(instrument, spread_pips, slippage_pips)
+                    fill = close - cost if trade.side == "long" else close + cost
+                    _close_trade(instrument, fill, current_date, decision.reason)
+                continue
+
+            if stopped_today:
+                continue
+
+            if decision.action in {"enter_long", "enter_short"}:
+                candidates.append((instrument, decision))
+
+        remaining_slots = settings.adaptive_max_open_positions - len(open_trades)
+        if remaining_slots > 0 and candidates:
+            candidates.sort(key=lambda item: item[1].score, reverse=True)
+            for instrument, decision in candidates[:remaining_slots]:
+                row = slices[instrument].iloc[-1]
+                close = float(row["close"])
+                side = "long" if decision.action == "enter_long" else "short"
+                stop_multiple = decision.stop_atr_multiple or settings.atr_stop_multiple
+                stop_price = (
+                    close - stop_multiple * decision.atr
+                    if side == "long"
+                    else close + stop_multiple * decision.atr
+                )
+                stop_distance = abs(close - stop_price)
+                risk_fraction = float(decision.risk_fraction or 0.0)
+                if stop_distance <= 0 or risk_fraction <= 0:
+                    continue
+                cost = _adverse_cost(instrument, spread_pips, slippage_pips)
+                entry_price = close + cost if side == "long" else close - cost
+                risk_dollars = risk_fraction * equity
+                open_trades[instrument] = _OpenTrade(
+                    instrument=instrument,
+                    side=side,
+                    entry_price=entry_price,
+                    stop_price=stop_price,
+                    initial_stop_price=stop_price,
+                    opened_at=current_date,
+                    regime=decision.regime,
+                    entry_kind=decision.entry_kind,
+                    score=decision.score,
+                    risk_fraction=risk_fraction,
+                    risk_dollars=risk_dollars,
+                    price_per_risk_unit=risk_dollars / stop_distance,
+                )
+
+    return {
+        "trades": trades,
+        "equity_curve": equity_curve,
+        "equity_dates": equity_dates,
+        "final_equity": equity,
+        "dates": dates,
+    }
 
 
 def _max_dd(equity: list[float]) -> float:
@@ -94,10 +260,48 @@ def _max_dd(equity: list[float]) -> float:
     return dd
 
 
+def _cagr(equity_first: float, equity_last: float, start_date: str | None, end_date: str | None) -> float:
+    if equity_first <= 0 or not start_date or not end_date:
+        return 0.0
+    d0 = datetime.fromisoformat(start_date)
+    d1 = datetime.fromisoformat(end_date)
+    days = max(1, (d1 - d0).days)
+    years = days / 365.25
+    if years <= 0:
+        return 0.0
+    return (equity_last / equity_first) ** (1.0 / years) - 1.0
+
+
+def _metrics(
+    trades: list[dict[str, Any]],
+    equity_curve: list[float],
+    start_date: str | None,
+    end_date: str | None,
+) -> dict[str, Any]:
+    gp = sum(t["pnl"] for t in trades if t["pnl"] > 0)
+    gl = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
+    wins = [t for t in trades if t["pnl"] > 0]
+    equity_first = equity_curve[0] if equity_curve else 0.0
+    equity_last = equity_curve[-1] if equity_curve else equity_first
+    # pf is left as None (not float("inf")) when there are winners but no
+    # losers, since "Infinity" is not valid JSON and would break the
+    # dashboard's fetch(...).json() call.
+    pf = (gp / gl) if gl else (None if gp else 0.0)
+    return {
+        "cagr": _cagr(equity_first, equity_last, start_date, end_date),
+        "max_dd": _max_dd(equity_curve),
+        "pf": pf,
+        "win_rate": len(wins) / len(trades) if trades else 0.0,
+        "trades": len(trades),
+        "avg_r": mean(t["r"] for t in trades) if trades else 0.0,
+        "profit": sum(t["pnl"] for t in trades),
+    }
+
+
 def _annual(trades: list[dict[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for t in trades:
-        y = t["entry_date"][:4]
+        y = t["exit_date"][:4]
         out.setdefault(y, {"trades": 0, "pnl": 0.0, "wins": 0})
         out[y]["trades"] += 1
         out[y]["pnl"] += t["pnl"]
@@ -108,37 +312,37 @@ def _annual(trades: list[dict[str, Any]]) -> dict[str, Any]:
     return out
 
 
-def _concentration(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    prof: dict[str, float] = defaultdict(float)
-    total = sum(max(0.0, t["pnl"]) for t in trades)
+def _group_metrics(
+    trades: list[dict[str, Any]], key_fn: Callable[[dict[str, Any]], str]
+) -> dict[str, Any]:
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for t in trades:
-        prof[t["symbol"]] += max(0.0, t["pnl"])
-    vals = sorted(prof.values(), reverse=True)
-    return {
-        "top1_share": (vals[0] / total) if total and vals else 0.0,
-        "top3_share": (sum(vals[:3]) / total) if total else 0.0,
-    }
+        groups[key_fn(t)].append(t)
+    result: dict[str, Any] = {}
+    for key, group_trades in groups.items():
+        gp = sum(t["pnl"] for t in group_trades if t["pnl"] > 0)
+        gl = abs(sum(t["pnl"] for t in group_trades if t["pnl"] < 0))
+        wins = [t for t in group_trades if t["pnl"] > 0]
+        pf = (gp / gl) if gl else (None if gp else 0.0)
+        result[key] = {
+            "trades": len(group_trades),
+            "win_rate": len(wins) / len(group_trades) if group_trades else 0.0,
+            "pf": pf,
+            "avg_r": mean(t["r"] for t in group_trades) if group_trades else 0.0,
+            "profit": sum(t["pnl"] for t in group_trades),
+        }
+    return result
 
 
-def _metrics(trades: list[dict[str, Any]], equity: list[float]) -> dict[str, Any]:
-    gp = sum(t["pnl"] for t in trades if t["pnl"] > 0)
-    gl = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
-    wins = [t for t in trades if t["pnl"] > 0]
-    cagr = 0.0
-    if len(equity) >= 2 and equity[0] > 0:
-        cagr = (equity[-1] / equity[0]) ** (252 / max(1, len(equity))) - 1
-    return {
-        "cagr": cagr,
-        "max_dd": _max_dd(equity),
-        "pf": (gp / gl) if gl else (float("inf") if gp else 0.0),
-        "win_rate": len(wins) / len(trades) if trades else 0.0,
-        "trades": len(trades),
-        "avg_r": _sma(t["r"] for t in trades) if trades else 0.0,
-        "profit": sum(t["pnl"] for t in trades),
-    }
+def _score_band(score: float, settings: Settings) -> str:
+    if score >= settings.adaptive_score_high:
+        return f">={settings.adaptive_score_high:.0f}"
+    if score >= settings.adaptive_score_medium:
+        return f"{settings.adaptive_score_medium:.0f}-{settings.adaptive_score_high:.0f}"
+    return f"{settings.adaptive_score_min:.0f}-{settings.adaptive_score_medium:.0f}"
 
 
-def _split_dates(dates: list[date]) -> tuple[set[date], set[date], set[date]]:
+def _split_dates(dates: list[str]) -> tuple[set[str], set[str], set[str]]:
     if len(dates) < 3:
         return set(dates), set(), set()
     a = int(len(dates) * 0.6)
@@ -146,276 +350,140 @@ def _split_dates(dates: list[date]) -> tuple[set[date], set[date], set[date]]:
     return set(dates[:a]), set(dates[a:b]), set(dates[b:])
 
 
-def _window_for_split(dates: list[date], split: str) -> set[date]:
-    train, validation, test = _split_dates(dates)
-    return {"train": train, "validation": validation, "test": test}[split]
-
-
-def _liquid_symbols(universe: dict[str, list[Bar]], min_value: float = 50_000_000) -> list[str]:
-    return [
-        symbol
-        for symbol, bars in universe.items()
-        if bars and _avg_value(bars, len(bars) - 1, 20) >= min_value
-    ]
-
-
-def _signal_rows(
-    universe: dict[str, list[Bar]],
-    allowed_dates: set[date],
-    *,
-    event_shift: float = 0.0,
-    cost_mult: float = 1.0,
-) -> dict[str, list[dict[str, Any]]]:
-    symbols = _liquid_symbols(universe)
-    dates = sorted({bar.date for bars in universe.values() for bar in bars if bar.date in allowed_dates})
-    per_strategy: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    if not dates:
-        return per_strategy
-
-    for current in dates[120:]:
-        ranked: list[dict[str, Any]] = []
-        for sym in symbols:
-            bars = universe[sym]
-            idx = next((i for i, b in enumerate(bars) if b.date == current), None)
-            if idx is None or idx < 120 or idx + 1 >= len(bars):
-                continue
-            close = bars[idx].close
-            ranked.append(
-                {
-                    "sym": sym,
-                    "idx": idx,
-                    "close": close,
-                    "r5": _ret(bars[idx - 5].close, close) if idx >= 5 else 0.0,
-                    "r20": _ret(bars[idx - 20].close, close),
-                    "r120": _ret(bars[idx - 120].close, close),
-                    "ma60": _sma(b.close for b in bars[idx - 59 : idx + 1]),
-                    "value20": _avg_value(bars, idx, 20),
-                    "atr20": _atr(bars, idx, 20) * cost_mult,
-                }
-            )
-        if not ranked:
-            continue
-
-        by20 = sorted(ranked, key=lambda x: x["r20"], reverse=True)
-        by120 = sorted(ranked, key=lambda x: x["r120"], reverse=True)
-        by_value = sorted(ranked, key=lambda x: x["value20"], reverse=True)
-
-        market_weak = mean(x["r20"] for x in by20[: min(20, len(by20))]) < 0
-        cutoff_a = by20[max(0, len(by20) // 10 - 1)]["r20"]
-        cutoff_c = sorted(x["r5"] for x in ranked)[max(0, len(ranked) // 5 - 1)]
-
-        top_a = {x["sym"] for x in by20[: max(1, len(by20) // 10)]}
-        top_b = {x["sym"] for x in by120[: max(1, len(by120) // 5)]}
-        top_c = {x["sym"] for x in by120[: max(1, len(by120) * 3 // 10)]}
-        liquid = {x["sym"] for x in by_value[: max(1, len(by_value) // 2)]}
-
-        for row in ranked:
-            sym = row["sym"]
-            bars = universe[sym]
-            entry = bars[row["idx"] + 1]
-            atr = max(row["atr20"], 1e-9)
-            shares = max(1, int((1_000_000 * 0.0035) / (2 * atr)))
-            risk_amt = shares * (2 * atr)
-
-            def add(strategy: str, exit_idx: int, reason: str):
-                exit_bar = bars[min(exit_idx, len(bars) - 1)]
-                pnl = (exit_bar.close - entry.open) * shares
-                per_strategy[strategy].append(
-                    {
-                        "strategy": strategy,
-                        "symbol": sym,
-                        "entry_date": entry.date.isoformat(),
-                        "exit_date": exit_bar.date.isoformat(),
-                        "entry_price": entry.open,
-                        "exit_price": exit_bar.close,
-                        "pnl": pnl,
-                        "r": pnl / risk_amt if risk_amt else 0.0,
-                        "reason": reason,
-                    }
-                )
-
-            if (not market_weak) and sym in top_a and row["r20"] < cutoff_a * (1 + event_shift):
-                add("A Event", row["idx"] + STRATEGIES["A Event"].hold_days, "event-drift")
-            if sym in top_b and sym in liquid and row["close"] > row["ma60"]:
-                add("B Momentum", row["idx"] + STRATEGIES["B Momentum"].hold_days, "weekly-momentum")
-            if sym in top_c and row["r5"] <= cutoff_c * (1 + event_shift) and row["close"] > row["ma60"]:
-                add("C Pullback", row["idx"] + STRATEGIES["C Pullback"].hold_days, "trend-pullback")
-    return per_strategy
-
-
-def _assemble_result(
-    per_strategy: dict[str, list[dict[str, Any]]], initial_equity: float
-) -> dict[str, Any]:
-    strategies: dict[str, Any] = {}
-    portfolio: list[dict[str, Any]] = []
-    for name, trades in per_strategy.items():
-        equity = [initial_equity]
-        for t in sorted(trades, key=lambda x: x["exit_date"]):
-            equity.append(equity[-1] + t["pnl"])
-        strategies[name] = {
-            "trades": trades,
-            "equity": equity,
-            "metrics": _metrics(trades, equity),
-            "annual": _annual(trades),
-            "concentration": _concentration(trades),
-        }
-        portfolio.extend(trades)
-
-    peq = [initial_equity]
-    for t in sorted(portfolio, key=lambda x: x["exit_date"]):
-        peq.append(peq[-1] + t["pnl"])
+def _baseline_config(settings: Settings) -> dict[str, Any]:
     return {
-        "strategies": strategies,
-        "portfolio": {
-            "trades": portfolio,
-            "equity": peq,
-            "metrics": _metrics(portfolio, peq),
-            "annual": _annual(portfolio),
-            "concentration": _concentration(portfolio),
-        },
+        "strategy_profile": "adaptive_dual_regime_v1",
+        "adaptive_strength_gap_min": settings.adaptive_strength_gap_min,
+        "adaptive_score_min": settings.adaptive_score_min,
+        "adaptive_score_medium": settings.adaptive_score_medium,
+        "adaptive_score_high": settings.adaptive_score_high,
+        "adaptive_trend_adx": settings.adaptive_trend_adx,
+        "adaptive_range_adx": settings.adaptive_range_adx,
+        "adaptive_max_open_positions": settings.adaptive_max_open_positions,
     }
 
 
-def _allocation_grid() -> list[dict[str, int]]:
-    candidates: list[dict[str, int]] = []
-    for a in (0, 20, 40, 60, 80, 100):
-        for b in (0, 20, 40, 60, 80, 100 - a):
-            c = 100 - a - b
-            if c < 0:
-                continue
-            if c % 20 != 0:
-                continue
-            candidates.append({"A": a, "B": b, "C": c})
-    return candidates
+def _empty_result(settings: Settings) -> dict[str, Any]:
+    return {
+        "period": {},
+        "metrics": {},
+        "annual": {},
+        "by_symbol": {},
+        "by_regime": {},
+        "by_score_band": {},
+        "sensitivity": {},
+        "train": {},
+        "validation": {},
+        "test": {},
+        "walk_forward": {},
+        "cost_assumptions": {},
+        "baseline_config": _baseline_config(settings),
+    }
 
 
-def _portfolio_score(metrics: dict[str, Any]) -> tuple[float, float, float]:
-    return (
-        metrics.get("cagr", 0.0),
-        -metrics.get("max_dd", 0.0),
-        metrics.get("pf", 0.0),
+def run_research(
+    candles_by_instrument: Mapping[str, pd.DataFrame],
+    settings: Settings,
+    initial_equity: float = 1_000_000.0,
+) -> dict[str, Any]:
+    if not candles_by_instrument:
+        return _empty_result(settings)
+
+    base = _simulate(
+        candles_by_instrument,
+        settings,
+        initial_equity=initial_equity,
+        spread_pips=DEFAULT_SPREAD_PIPS,
+        slippage_pips=DEFAULT_SLIPPAGE_PIPS,
+    )
+    high_cost = _simulate(
+        candles_by_instrument,
+        settings,
+        initial_equity=initial_equity,
+        spread_pips=HIGH_COST_SPREAD_PIPS,
+        slippage_pips=HIGH_COST_SLIPPAGE_PIPS,
     )
 
-
-def _blend_strategies(result: dict[str, Any], allocation: dict[str, int]) -> dict[str, Any]:
-    selected = []
-    for name, weight in allocation.items():
-        trades = result["strategies"].get(f"{name} Event" if name == "A" else f"{name} Momentum" if name == "B" else f"{name} Pullback", {}).get("trades", [])
-        selected.extend((weight, trade) for trade in trades)
-    selected.sort(key=lambda item: item[1]["exit_date"])
-    equity = [1_000_000.0]
-    for weight, trade in selected:
-        equity.append(equity[-1] + trade["pnl"] * (weight / 100.0))
-    trades = [trade for _, trade in selected]
-    return {
-        "allocation": allocation,
-        "metrics": _metrics(trades, equity),
-        "equity": equity,
-        "trades": trades,
-    }
-
-
-def _sensitivity_suite(universe: dict[str, list[Bar]], allowed_dates: set[date]) -> dict[str, Any]:
-    scenarios = {
-        "base": _assemble_result(_signal_rows(universe, allowed_dates), 1_000_000)["portfolio"]["metrics"],
-        "cost_x2": _assemble_result(_signal_rows(universe, allowed_dates, cost_mult=2.0), 1_000_000)["portfolio"]["metrics"],
-        "loose": _assemble_result(_signal_rows(universe, allowed_dates, event_shift=-0.10), 1_000_000)["portfolio"]["metrics"],
-        "tight": _assemble_result(_signal_rows(universe, allowed_dates, event_shift=0.10), 1_000_000)["portfolio"]["metrics"],
-    }
-    return scenarios
-
-
-def run_backtest(
-    universe: dict[str, list[Bar]],
-    initial_equity: float = 1_000_000,
-    risk_per_trade: float = 0.0035,
-) -> dict[str, Any]:
-    del risk_per_trade
-    dates = sorted({bar.date for bars in universe.values() for bar in bars})
-    if not dates:
-        return {"universe_size": 0, "strategies": {}, "portfolio": {}}
+    trades = base["trades"]
+    dates = base["dates"]
+    start_date = dates[0] if dates else None
+    end_date = dates[-1] if dates else None
+    metrics = _metrics(trades, base["equity_curve"], start_date, end_date)
+    high_cost_metrics = _metrics(
+        high_cost["trades"], high_cost["equity_curve"], start_date, end_date
+    )
 
     train_dates, validation_dates, test_dates = _split_dates(dates)
-    train_raw = _signal_rows(universe, train_dates)
-    validation_raw = _signal_rows(universe, validation_dates)
-    test_raw = _signal_rows(universe, test_dates)
-    train_result = _assemble_result(train_raw, initial_equity)
-    validation_result = _assemble_result(validation_raw, initial_equity)
-    test_result = _assemble_result(test_raw, initial_equity)
 
-    fold_dates = []
+    def _period_result(period_dates: set[str]) -> dict[str, Any]:
+        subset = [t for t in trades if t["exit_date"] in period_dates]
+        subset_equity = [
+            e for e, d in zip(base["equity_curve"], base["equity_dates"]) if d in period_dates
+        ]
+        p_start = min(period_dates) if period_dates else None
+        p_end = max(period_dates) if period_dates else None
+        return {
+            "trades": len(subset),
+            "metrics": _metrics(subset, subset_equity, p_start, p_end),
+            "annual": _annual(subset),
+        }
+
+    train_result = _period_result(train_dates)
+    validation_result = _period_result(validation_dates)
+    test_result = _period_result(test_dates)
+
+    fold_dates: list[set[str]] = []
     if test_dates:
-        test_dates_list = sorted(test_dates)
-        fold_size = max(1, len(test_dates) // 5)
+        test_list = sorted(test_dates)
+        fold_size = max(1, len(test_list) // 5)
         for i in range(5):
             start = i * fold_size
-            end = len(test_dates_list) if i == 4 else min(len(test_dates_list), (i + 1) * fold_size)
-            fold_dates.append(set(test_dates_list[start:end]))
+            end = len(test_list) if i == 4 else min(len(test_list), (i + 1) * fold_size)
+            fold_dates.append(set(test_list[start:end]))
     folds = []
     for idx, fold in enumerate(fold_dates, start=1):
-        fold_result = _assemble_result(_signal_rows(universe, fold), initial_equity)
-        folds.append(
-            {
-                "fold": idx,
-                "dates": len(fold),
-                "metrics": fold_result["portfolio"]["metrics"],
-            }
-        )
+        folds.append({"fold": idx, "dates": len(fold), **_period_result(fold)})
+    fold_positive = sum(1 for f in folds if f["metrics"]["cagr"] > 0)
 
-    grid = []
-    for allocation in _allocation_grid():
-        grid.append(
-            {
-                "allocation": allocation,
-                "score": _portfolio_score(_blend_strategies(validation_result, allocation)["metrics"]),
-            }
-        )
-    best_allocation = max(grid, key=lambda item: item["score"])["allocation"] if grid else {"A": 40, "B": 40, "C": 20}
-
-    portfolio_blend = _blend_strategies(test_result, best_allocation)
-    if portfolio_blend["trades"]:
-        one_symbol = sorted(
-            defaultdict(float, {
-                trade["symbol"]: sum(max(0.0, t["pnl"]) for t in portfolio_blend["trades"] if t["symbol"] == trade["symbol"])
-                for trade in portfolio_blend["trades"]
-            }).values(),
-            reverse=True,
-        )
-        total_pos = sum(max(0.0, t["pnl"]) for t in portfolio_blend["trades"])
-        top1_share = one_symbol[0] / total_pos if total_pos and one_symbol else 0.0
-    else:
-        top1_share = 0.0
-
-    combined = {
+    return {
+        "period": {"start": start_date, "end": end_date, "trading_days": len(dates)},
+        "metrics": metrics,
+        "annual": _annual(trades),
+        "by_symbol": _group_metrics(trades, lambda t: t["instrument"]),
+        "by_regime": _group_metrics(trades, lambda t: t["regime"]),
+        "by_score_band": _group_metrics(trades, lambda t: _score_band(t["score"], settings)),
+        "sensitivity": {
+            "base": {
+                "cost_pips": {
+                    "spread": DEFAULT_SPREAD_PIPS,
+                    "slippage": DEFAULT_SLIPPAGE_PIPS,
+                },
+                "metrics": metrics,
+            },
+            "cost_x2": {
+                "cost_pips": {
+                    "spread": HIGH_COST_SPREAD_PIPS,
+                    "slippage": HIGH_COST_SLIPPAGE_PIPS,
+                },
+                "metrics": high_cost_metrics,
+            },
+        },
         "train": train_result,
         "validation": validation_result,
         "test": test_result,
         "walk_forward": {
-            "best_allocation": best_allocation,
-            "grid": grid,
-            "out_of_sample": portfolio_blend,
-            "top1_share": top1_share,
             "folds": folds,
+            "fold_positive": fold_positive,
+            "fold_total": len(folds),
         },
-        "sensitivity": _sensitivity_suite(universe, test_dates),
-        "annual_stability": {
-            "train_positive_year_ratio": _positive_year_ratio(train_result["portfolio"]["annual"]),
-            "validation_positive_year_ratio": _positive_year_ratio(validation_result["portfolio"]["annual"]),
-            "test_positive_year_ratio": _positive_year_ratio(test_result["portfolio"]["annual"]),
+        "cost_assumptions": {
+            "base_spread_pips": DEFAULT_SPREAD_PIPS,
+            "base_slippage_pips": DEFAULT_SLIPPAGE_PIPS,
+            "high_spread_pips": HIGH_COST_SPREAD_PIPS,
+            "high_slippage_pips": HIGH_COST_SLIPPAGE_PIPS,
         },
+        "baseline_config": _baseline_config(settings),
     }
-
-    combined["strategies"] = train_result["strategies"]
-    combined["portfolio"] = test_result["portfolio"]
-    combined["universe_size"] = len(_liquid_symbols(universe))
-    return combined
-
-
-def _positive_year_ratio(annual: dict[str, Any]) -> float:
-    if not annual:
-        return 0.0
-    positives = [1 for stats in annual.values() if stats.get("pnl", 0.0) > 0]
-    return len(positives) / len(annual)
 
 
 def dump_results(results: dict[str, Any], path: str | Path) -> None:
@@ -425,3 +493,56 @@ def dump_results(results: dict[str, Any], path: str | Path) -> None:
         json.dumps(results, ensure_ascii=False, indent=2, default=str),
         encoding="utf-8",
     )
+
+
+def load_cached_results(
+    cache_path: str | Path, data_dir: str | Path
+) -> dict[str, Any] | None:
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+    data_root = Path(data_dir)
+    newest_source = 0.0
+    if data_root.exists():
+        for f in data_root.glob("*.json"):
+            newest_source = max(newest_source, f.stat().st_mtime)
+    if newest_source and cache_path.stat().st_mtime < newest_source:
+        return None
+    try:
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
+def main(argv: list[str] | None = None) -> int:
+    from .fx_research_data import DEFAULT_RESEARCH_DATA_DIR, load_history
+
+    parser = argparse.ArgumentParser(description="Run FX adaptive research backtest")
+    parser.add_argument("command", choices=["run"])
+    parser.add_argument("--data-dir", default=DEFAULT_RESEARCH_DATA_DIR)
+    parser.add_argument(
+        "--cache-path", default="data/research/fx_adaptive_backtest.json"
+    )
+    args = parser.parse_args(argv)
+
+    settings = Settings.from_env()
+    history = load_history(args.data_dir)
+    if not history:
+        print(f"NO_DATA: no synced history found under {args.data_dir}")
+        return 1
+
+    payload = run_research(history, settings, initial_equity=settings.paper_initial_balance)
+    dump_results(payload, args.cache_path)
+    metrics = payload.get("metrics", {})
+    print(
+        "RESEARCH_OK "
+        f"trades={metrics.get('trades', 0)} "
+        f"cagr={metrics.get('cagr')} "
+        f"max_dd={metrics.get('max_dd')} "
+        f"pf={metrics.get('pf')}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
