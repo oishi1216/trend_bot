@@ -1,52 +1,396 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="ja">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name }}</title>
   <style>
-    :root { font-family: system-ui, sans-serif; color-scheme: light dark; }
-    body { max-width: 1100px; margin: 0 auto; padding: 24px; }
-    header { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
-    button { padding: 10px 16px; cursor: pointer; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 12px; }
-    .card { border: 1px solid #8886; border-radius: 12px; padding: 16px; }
-    .warning { border-left: 5px solid; padding: 12px; margin: 16px 0; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #8885; font-size: 14px; }
-    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-    .muted { opacity: .72; }
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: rgba(13, 19, 38, 0.86);
+      --panel-strong: #121a33;
+      --line: rgba(255, 255, 255, 0.10);
+      --text: #eef2ff;
+      --muted: #95a2c6;
+      --accent: #58d6c5;
+      --accent-2: #7aa7ff;
+      --warn: #ffb86b;
+      --good: #7ee787;
+      --bad: #ff7b72;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(122, 167, 255, 0.18), transparent 30%),
+        radial-gradient(circle at top right, rgba(88, 214, 197, 0.18), transparent 28%),
+        linear-gradient(180deg, #08101d, #0c1122 50%, #090d18);
+    }
+    .shell { max-width: 1300px; margin: 0 auto; padding: 28px 20px 40px; }
+    header { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 30px; letter-spacing: 0.02em; }
+    .subtle { color: var(--muted); margin-top: 6px; }
+    .tabs { display: flex; gap: 8px; margin: 18px 0; flex-wrap: wrap; }
+    .tab {
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 10px 16px;
+      cursor: pointer;
+    }
+    .tab.active { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #08101d; font-weight: 700; }
+    .panel {
+      display: none;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      backdrop-filter: blur(14px);
+      border-radius: 20px;
+      padding: 18px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.24);
+    }
+    .panel.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); gap: 12px; }
+    .card {
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.04);
+      border-radius: 16px;
+      padding: 14px;
+      min-height: 82px;
+    }
+    .card.highlight {
+      border-color: rgba(122, 167, 255, 0.55);
+      background: linear-gradient(180deg, rgba(122,167,255,0.14), rgba(255,255,255,0.04));
+      box-shadow: inset 0 0 0 1px rgba(122, 167, 255, 0.12), 0 12px 24px rgba(0,0,0,.18);
+    }
+    .card.strong-highlight {
+      border-color: rgba(126, 231, 135, 0.75);
+      background: linear-gradient(180deg, rgba(126,231,135,0.16), rgba(255,255,255,0.05));
+      box-shadow: inset 0 0 0 1px rgba(126, 231, 135, 0.18), 0 12px 24px rgba(0,0,0,.20);
+    }
+    .row-candidate { background: rgba(122, 167, 255, 0.08); }
+    .row-action-candidate { background: rgba(126, 231, 135, 0.14); }
+    .card b { display: block; margin-bottom: 8px; color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+    .metric { font-size: 24px; font-weight: 700; }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; overflow: hidden; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    .section { margin-top: 16px; }
+    .section h2 { margin: 0 0 10px; font-size: 18px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 999px;
+      background: rgba(255,255,255,0.08); border: 1px solid var(--line);
+      font-size: 12px;
+    }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+    pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .stack { display: grid; gap: 12px; }
+    .history-item { display: grid; gap: 6px; }
+    .muted { color: var(--muted); }
+    .reason-detail { margin-top: 6px; display: block; color: var(--muted); }
+    .reason-detail summary { cursor: pointer; color: var(--text); }
+    .badge.good { border-color: rgba(126, 231, 135, 0.45); }
+    .badge.warn { border-color: rgba(255, 184, 107, 0.45); }
+    .badge.bad { border-color: rgba(255, 123, 114, 0.45); }
+    @media (max-width: 720px) {
+      header { flex-direction: column; }
+      .shell { padding: 18px 12px 28px; }
+      h1 { font-size: 24px; }
+    }
   </style>
 </head>
 <body>
-<header>
-  <div><h1>{{ app_name }}</h1><div class="muted">日足トレンドフォロー自動売買 MVP</div></div>
-  <button id="run">今すぐ1回実行</button>
-</header>
-<div class="warning">実口座の利益を保証するものではありません。最初は paper または practice だけで検証してください。</div>
-<div id="summary" class="grid"></div>
-<h2>ポジション</h2>
-<div class="card"><table><thead><tr><th>通貨</th><th>方向</th><th>数量</th><th>建値</th><th>損切り</th><th>予定リスク</th></tr></thead><tbody id="positions"></tbody></table></div>
-<h2>最近のイベント</h2>
-<div id="events"></div>
+<div class="shell">
+  <header>
+    <div>
+      <h1>{{ app_name }}</h1>
+      <div class="subtle">Adaptive は読み取り専用で先頭表示します。Legacy は既存の見え方を壊さず残します。</div>
+    </div>
+    <div class="badge">完全読み取り専用</div>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" data-target="adaptive">Adaptive</button>
+    <button class="tab" data-target="research">Research</button>
+    <button class="tab" data-target="legacy">Legacy</button>
+  </div>
+
+  <section id="adaptive" class="panel active">
+    <div class="grid" id="adaptive-summary"></div>
+
+    <div class="section">
+      <h2>10通貨の判定</h2>
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th>通貨ペア</th>
+              <th>regime</th>
+              <th>score</th>
+              <th>strength_gap</th>
+              <th>status</th>
+              <th>action</th>
+              <th>no-entry reason</th>
+            </tr>
+          </thead>
+          <tbody id="adaptive-rows"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>直近の実行履歴</h2>
+      <div class="stack" id="adaptive-history"></div>
+    </div>
+
+    <div class="section">
+      <h2>補足</h2>
+      <div class="card" id="adaptive-task"></div>
+    </div>
+  </section>
+
+  <section id="research" class="panel">
+    <div class="grid" id="research-summary"></div>
+    <div class="section">
+      <h2>総合判定</h2>
+      <div class="card" id="research-judgement"></div>
+    </div>
+    <div class="section">
+      <h2>合否一覧</h2>
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th>指標</th>
+              <th>実績</th>
+              <th>基準</th>
+              <th>判定</th>
+            </tr>
+          </thead>
+          <tbody id="research-checks"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Walk-forward / 感度</h2>
+      <div class="grid" id="research-analysis"></div>
+      <div class="section">
+        <div class="card" id="research-sensitivity"></div>
+      </div>
+    </div>
+    <div class="section">
+      <h2>200銘柄同期見積もり</h2>
+      <div class="card" id="research-api-estimate"></div>
+    </div>
+    <div class="section">
+      <h2>Strategy Breakdown</h2>
+      <div class="card" id="research-strategies"></div>
+    </div>
+    <div class="section">
+      <h2>Portfolio</h2>
+      <div class="card" id="research-portfolio"></div>
+    </div>
+    <div class="section">
+      <h2>Notes</h2>
+      <div class="card" id="research-meta"></div>
+    </div>
+  </section>
+
+  <section id="legacy" class="panel">
+    <div class="grid" id="legacy-summary"></div>
+    <div class="section">
+      <h2>Open Positions</h2>
+      <div class="card"><table><thead><tr><th>instrument</th><th>side</th><th>units</th><th>entry_price</th><th>stop_price</th><th>planned_risk_home</th></tr></thead><tbody id="legacy-positions"></tbody></table></div>
+    </div>
+    <div class="section">
+      <h2>Recent Events</h2>
+      <div id="legacy-events" class="stack"></div>
+    </div>
+  </section>
+</div>
+
 <script>
 const money = x => x == null ? '-' : Number(x).toLocaleString(undefined,{maximumFractionDigits:2});
-async function refresh(){
-  const [s,e] = await Promise.all([fetch('/api/status').then(r=>r.json()), fetch('/api/events?limit=30').then(r=>r.json())]);
-  document.getElementById('summary').innerHTML = `
-    <div class="card"><b>モード</b><div>${s.mode}</div></div>
-    <div class="card"><b>新規取引</b><div>${s.trading_armed ? 'ARMED' : '停止中'}</div></div>
-    <div class="card"><b>NAV</b><div>${money(s.nav)}</div><small>${s.nav_error || ''}</small></div>
-    <div class="card"><b>ドローダウン</b><div>${s.drawdown == null ? '-' : (s.drawdown*100).toFixed(2)+'%'}</div></div>`;
-  document.getElementById('positions').innerHTML = s.positions.length ? s.positions.map(p=>`<tr><td>${p.instrument}</td><td>${p.side}</td><td>${p.units}</td><td>${p.entry_price}</td><td>${p.stop_price}</td><td>${money(p.planned_risk_home)}</td></tr>`).join('') : '<tr><td colspan="6">なし</td></tr>';
-  document.getElementById('events').innerHTML = e.map(x=>`<div class="card"><b>${x.kind}</b> <span class="muted">${x.ts} ${x.instrument||''}</span><pre>${JSON.stringify(x.payload,null,2)}</pre></div>`).join('');
+const pct = x => x == null ? '-' : (Number(x) * 100).toFixed(2) + '%';
+const dt = x => x ? new Intl.DateTimeFormat('ja-JP', {
+  timeZone: 'Asia/Tokyo',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+}).format(new Date(x)).replaceAll('/', '/') + ' JST' : '-';
+const badgeClass = value => value === 'failure' ? 'bad' : value === 'success' ? 'good' : 'warn';
+const reasonSummary = row => row.no_entry_reason_summary || row.no_entry_reason || '-';
+const judgementBadge = grade => grade === 'PASS' ? 'good' : grade === 'WARN' ? 'warn' : 'bad';
+
+function renderAdaptive(data) {
+  const s = data.status || {};
+  const latest = data.latest_run || {};
+  document.getElementById('adaptive-summary').innerHTML = `
+    <div class="card"><b>NAV</b><div class="metric">${money(s.nav)}</div><div class="hint">strategy_profile: ${s.strategy_profile || '-'}</div></div>
+    <div class="card"><b>Drawdown</b><div class="metric ${Number(s.drawdown || 0) > 0 ? 'warn' : 'good'}">${pct(s.drawdown)}</div><div class="hint">Monthly Loss: ${pct(s.monthly_loss)}</div></div>
+    <div class="card"><b>Open Positions</b><div class="metric">${(s.positions || []).length}</div><div class="hint">現在の保有数</div></div>
+    <div class="card"><b>22:15 Auto Run</b><div class="metric ${data.task_status?.last_result === 'failure' ? 'bad' : 'good'}">${data.task_status?.last_result || 'unknown'}</div><div class="hint">${dt(data.task_status?.last_run_time)}</div></div>
+  `;
+
+  const rows = s.currency_rows || [];
+  document.getElementById('adaptive-rows').innerHTML = rows.map(row => `
+    <tr class="${row.is_action_candidate ? 'row-action-candidate strong-highlight' : row.is_candidate ? 'row-candidate highlight' : ''}">
+      <td>${row.instrument || '-'}</td>
+      <td>${row.regime || '-'}</td>
+      <td>${row.score > 0 ? `<span class="badge good">score ${money(row.score)}</span>` : money(row.score)}</td>
+      <td>${row.strength_gap == null ? '-' : Number(row.strength_gap).toFixed(2)}</td>
+      <td>${row.status || '-'}</td>
+      <td>${row.action && row.action !== 'none' ? `<span class="badge good">${row.action}</span>` : '-'}</td>
+      <td>
+        <div>${reasonSummary(row)}</div>
+        <details class="reason-detail">
+          <summary>詳細</summary>
+          <div class="hint">${row.no_entry_reason || '-'}</div>
+        </details>
+      </td>
+    </tr>
+  `).join('') || '<tr><td colspan="7">データがありません</td></tr>';
+
+  document.getElementById('adaptive-history').innerHTML = (data.runs || []).map(run => `
+    <div class="card history-item ${run.has_candidate ? 'highlight' : ''}">
+      <div><span class="badge ${badgeClass(run.status)}">${run.status || '-'}</span>${run.has_candidate ? ' <span class="badge good">候補あり</span>' : ''} <span class="muted">${dt(run.started_at)} → ${dt(run.finished_at)}</span></div>
+      <div>NAV ${money(run.nav)} / Drawdown ${pct(run.drawdown)} / Monthly Loss ${pct(run.monthly_loss)} / Results ${run.results_count ?? '-'}</div>
+    </div>
+  `).join('') || '<div class="card">履歴がありません</div>';
+
+  document.getElementById('adaptive-task').innerHTML = `
+    <div><b>task register</b> ${data.task_status?.task_registered ? 'Yes' : 'No'}</div>
+    <div class="subtle">latest log updated: ${dt(data.task_status?.latest_log_updated)}</div>
+  `;
 }
-document.getElementById('run').onclick = async ()=>{
-  const b=document.getElementById('run'); b.disabled=true; b.textContent='実行中…';
-  try { const r=await fetch('/api/run',{method:'POST'}); const j=await r.json(); if(!r.ok) throw new Error(JSON.stringify(j)); }
-  catch(e){ alert(e); } finally { b.disabled=false; b.textContent='今すぐ1回実行'; await refresh(); }
-};
-refresh(); setInterval(refresh, 30000);
+
+
+function renderResearch(data) {
+  const s = data.status || {};
+  const portfolio = data.portfolio || {};
+  const judgement = data.meta?.judgement || {};
+  const walkForward = judgement.walk_forward || {};
+  const apiEstimate = judgement.api_estimate || {};
+  document.getElementById('research-summary').innerHTML = `
+    <div class="card"><b>Mode</b><div class="metric">${s.mode || '-'}</div><div class="hint">${s.data_dir || '-'}</div></div>
+    <div class="card"><b>Universe</b><div class="metric">${s.universe_size ?? '-'}</div><div class="hint">loaded: ${s.loaded ? 'yes' : 'no'}</div></div>
+    <div class="card"><b>Portfolio CAGR</b><div class="metric ${Number(portfolio.metrics?.cagr || 0) >= 0 ? 'good' : 'bad'}">${pct(portfolio.metrics?.cagr)}</div></div>
+    <div class="card"><b>Portfolio DD</b><div class="metric warn">${pct(portfolio.metrics?.max_dd)}</div></div>
+  `;
+  document.getElementById('research-judgement').innerHTML = `
+    <div class="metric ${judgementBadge(judgement.overall)}">総合判定：${judgement.overall || '-'}</div>
+    <div class="hint">${judgement.headline || '-'}</div>
+    <div class="stack" style="margin-top:12px">
+      ${(judgement.reasons || []).map(line => `<div class="badge">${line}</div>`).join('')}
+    </div>
+  `;
+  document.getElementById('research-checks').innerHTML = (judgement.checks || []).map(row => `
+    <tr>
+      <td>${row.label}</td>
+      <td>${row.actual}</td>
+      <td>${row.basis}</td>
+      <td><span class="badge ${judgementBadge(row.grade)}">${row.grade}</span></td>
+    </tr>
+  `).join('') || '<tr><td colspan="4">判定データがありません</td></tr>';
+  const wf = walkForward.out_of_sample || {};
+  document.getElementById('research-analysis').innerHTML = `
+    <div class="card"><b>Walk-forward</b><div class="metric">${(judgement.checks || []).find(x => x.label === 'Walk-forward')?.actual || '-'}</div><div class="hint">過半数で PASS</div></div>
+    <div class="card"><b>Out of Sample CAGR</b><div class="metric">${pct(wf.metrics?.cagr)}</div><div class="hint">期間外のみ</div></div>
+    <div class="card"><b>Out of Sample DD</b><div class="metric warn">${pct(wf.metrics?.max_dd)}</div><div class="hint">期間外のみ</div></div>
+    <div class="card"><b>Best Allocation</b><div class="metric">${JSON.stringify((walkForward.best_allocation || {}))}</div><div class="hint">学習→検証で固定</div></div>
+  `;
+  const sensitivity = judgement.sensitivity || {};
+  const sensitivityRows = [
+    ['基準設定', sensitivity.base?.cagr],
+    ['少し緩い', sensitivity.loose?.cagr],
+    ['少し厳しい', sensitivity.tight?.cagr],
+    ['コスト2倍', sensitivity.cost_x2?.cagr],
+  ];
+  document.getElementById('research-sensitivity').innerHTML = `
+    <div><b>感度分析</b></div>
+    <div class="stack" style="margin-top:10px">
+      ${sensitivityRows.map(([label, value]) => `
+        <div class="card">
+          <b>${label}</b>
+          <div class="metric">${pct(value)}</div>
+          <div class="hint">${value != null && value > 0 ? '周辺でも利益が残る' : '中心だけが強い可能性があります'}</div>
+        </div>
+      `).join('')}
+    </div>
+  `;
+  const strategies = data.strategies || {};
+  document.getElementById('research-strategies').innerHTML = Object.entries(strategies).map(([name, v]) => `
+    <div class="card">
+      <b>${name}</b>
+      <div>Trades: ${v.metrics?.trades ?? 0} / PF: ${money(v.metrics?.pf)} / Win: ${pct(v.metrics?.win_rate)}</div>
+      <div class="hint">CAGR ${pct(v.metrics?.cagr)} / Max DD ${pct(v.metrics?.max_dd)} / Avg R ${money(v.metrics?.avg_r)}</div>
+    </div>`).join('') || '<div class="muted">戦略データがありません</div>';
+  document.getElementById('research-portfolio').innerHTML = `
+    <div>Trades: ${portfolio.metrics?.trades ?? 0}</div>
+    <div>PF: ${money(portfolio.metrics?.pf)} / Win: ${pct(portfolio.metrics?.win_rate)} / Avg R: ${money(portfolio.metrics?.avg_r)}</div>
+    <div>Top1 share: ${pct(portfolio.concentration?.top1_share)} / Top3 share: ${pct(portfolio.concentration?.top3_share)}</div>
+    <div class="hint">年次内訳: ${JSON.stringify(portfolio.annual || {})}</div>
+  `;
+  document.getElementById('research-meta').innerHTML = `
+    <div>API budget note: ${data.meta?.api_budget_note || '-'}</div>
+    <div class="hint">cache: ${data.meta?.cache_exists ? 'yes' : 'no'} / ${s.cache_path || '-'}</div>
+  `;
+  document.getElementById('research-api-estimate').innerHTML = `
+    <div>対象：${apiEstimate.target_symbols ?? '-'}銘柄</div>
+    <div>契約プラン：${apiEstimate.contract_plan || '-'}</div>
+    <div>API上限：${apiEstimate.api_limit_per_min ?? '-'} req/min</div>
+    <div>推定APIリクエスト：${apiEstimate.estimated_requests ?? '-'}</div>
+    <div>理論最短：約${apiEstimate.theoretical_min_minutes ?? '-'}分</div>
+    <div>推定所要時間：約${(apiEstimate.estimated_time_range_minutes || []).join('〜') || '-'}分</div>
+    <div>取得可能期間：${apiEstimate.available_period || '-'}</div>
+    <div class="hint">${apiEstimate.note || '-'}</div>
+  `;
+}
+
+function renderLegacy(s, events) {
+  document.getElementById('legacy-summary').innerHTML = `
+    <div class="card"><b>Mode</b><div class="metric">${s.mode || '-'}</div></div>
+    <div class="card"><b>Trading Armed</b><div class="metric">${s.trading_armed ? 'ARMED' : 'OFF'}</div></div>
+    <div class="card"><b>NAV</b><div class="metric">${money(s.nav)}</div><div class="hint">${s.nav_error || ''}</div></div>
+    <div class="card"><b>Drawdown</b><div class="metric">${pct(s.drawdown)}</div></div>
+  `;
+  document.getElementById('legacy-positions').innerHTML = (s.positions || []).map(p=>`<tr><td>${p.instrument}</td><td>${p.side}</td><td>${p.units}</td><td>${p.entry_price}</td><td>${p.stop_price}</td><td>${money(p.planned_risk_home)}</td></tr>`).join('') || '<tr><td colspan="6">なし</td></tr>';
+  document.getElementById('legacy-events').innerHTML = (events || []).map(x=>`<div class="card"><b>${x.kind}</b> <span class="muted">${x.ts} ${x.instrument||''}</span><pre>${JSON.stringify(x.payload,null,2)}</pre></div>`).join('') || '<div class="card">イベントがありません</div>';
+}
+
+async function refresh() {
+  const [adaptive, research, legacy, legacyEvents] = await Promise.all([
+    fetch('/api/adaptive/status').then(r=>r.json()),
+    fetch('/api/research/status').then(r=>r.json()),
+    fetch('/api/status').then(r=>r.json()),
+    fetch('/api/events?limit=20').then(r=>r.json()),
+  ]);
+  renderAdaptive(adaptive);
+  renderResearch(research);
+  renderLegacy(legacy, legacyEvents);
+}
+
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById(btn.dataset.target).classList.add('active');
+  });
+});
+
+refresh();
+setInterval(refresh, 30000);
 </script>
 </body>
 </html>
