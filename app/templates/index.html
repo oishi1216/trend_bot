@@ -71,6 +71,8 @@
       background: linear-gradient(180deg, rgba(126,231,135,0.16), rgba(255,255,255,0.05));
       box-shadow: inset 0 0 0 1px rgba(126, 231, 135, 0.18), 0 12px 24px rgba(0,0,0,.20);
     }
+    .row-candidate { background: rgba(122, 167, 255, 0.08); }
+    .row-action-candidate { background: rgba(126, 231, 135, 0.14); }
     .card b { display: block; margin-bottom: 8px; color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
     .metric { font-size: 24px; font-weight: 700; }
     .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
@@ -157,6 +159,37 @@
   <section id="research" class="panel">
     <div class="grid" id="research-summary"></div>
     <div class="section">
+      <h2>総合判定</h2>
+      <div class="card" id="research-judgement"></div>
+    </div>
+    <div class="section">
+      <h2>合否一覧</h2>
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th>指標</th>
+              <th>実績</th>
+              <th>基準</th>
+              <th>判定</th>
+            </tr>
+          </thead>
+          <tbody id="research-checks"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="section">
+      <h2>Walk-forward / 感度</h2>
+      <div class="grid" id="research-analysis"></div>
+      <div class="section">
+        <div class="card" id="research-sensitivity"></div>
+      </div>
+    </div>
+    <div class="section">
+      <h2>200銘柄同期見積もり</h2>
+      <div class="card" id="research-api-estimate"></div>
+    </div>
+    <div class="section">
       <h2>Strategy Breakdown</h2>
       <div class="card" id="research-strategies"></div>
     </div>
@@ -197,6 +230,7 @@ const dt = x => x ? new Intl.DateTimeFormat('ja-JP', {
 }).format(new Date(x)).replaceAll('/', '/') + ' JST' : '-';
 const badgeClass = value => value === 'failure' ? 'bad' : value === 'success' ? 'good' : 'warn';
 const reasonSummary = row => row.no_entry_reason_summary || row.no_entry_reason || '-';
+const judgementBadge = grade => grade === 'PASS' ? 'good' : grade === 'WARN' ? 'warn' : 'bad';
 
 function renderAdaptive(data) {
   const s = data.status || {};
@@ -210,7 +244,7 @@ function renderAdaptive(data) {
 
   const rows = s.currency_rows || [];
   document.getElementById('adaptive-rows').innerHTML = rows.map(row => `
-    <tr class="${row.is_action_candidate ? 'strong-highlight' : row.is_candidate ? 'highlight' : ''}">
+    <tr class="${row.is_action_candidate ? 'row-action-candidate strong-highlight' : row.is_candidate ? 'row-candidate highlight' : ''}">
       <td>${row.instrument || '-'}</td>
       <td>${row.regime || '-'}</td>
       <td>${row.score > 0 ? `<span class="badge good">score ${money(row.score)}</span>` : money(row.score)}</td>
@@ -244,11 +278,55 @@ function renderAdaptive(data) {
 function renderResearch(data) {
   const s = data.status || {};
   const portfolio = data.portfolio || {};
+  const judgement = data.meta?.judgement || {};
+  const walkForward = judgement.walk_forward || {};
+  const apiEstimate = judgement.api_estimate || {};
   document.getElementById('research-summary').innerHTML = `
     <div class="card"><b>Mode</b><div class="metric">${s.mode || '-'}</div><div class="hint">${s.data_dir || '-'}</div></div>
     <div class="card"><b>Universe</b><div class="metric">${s.universe_size ?? '-'}</div><div class="hint">loaded: ${s.loaded ? 'yes' : 'no'}</div></div>
     <div class="card"><b>Portfolio CAGR</b><div class="metric ${Number(portfolio.metrics?.cagr || 0) >= 0 ? 'good' : 'bad'}">${pct(portfolio.metrics?.cagr)}</div></div>
     <div class="card"><b>Portfolio DD</b><div class="metric warn">${pct(portfolio.metrics?.max_dd)}</div></div>
+  `;
+  document.getElementById('research-judgement').innerHTML = `
+    <div class="metric ${judgementBadge(judgement.overall)}">総合判定：${judgement.overall || '-'}</div>
+    <div class="hint">${judgement.headline || '-'}</div>
+    <div class="stack" style="margin-top:12px">
+      ${(judgement.reasons || []).map(line => `<div class="badge">${line}</div>`).join('')}
+    </div>
+  `;
+  document.getElementById('research-checks').innerHTML = (judgement.checks || []).map(row => `
+    <tr>
+      <td>${row.label}</td>
+      <td>${row.actual}</td>
+      <td>${row.basis}</td>
+      <td><span class="badge ${judgementBadge(row.grade)}">${row.grade}</span></td>
+    </tr>
+  `).join('') || '<tr><td colspan="4">判定データがありません</td></tr>';
+  const wf = walkForward.out_of_sample || {};
+  document.getElementById('research-analysis').innerHTML = `
+    <div class="card"><b>Walk-forward</b><div class="metric">${(judgement.checks || []).find(x => x.label === 'Walk-forward')?.actual || '-'}</div><div class="hint">過半数で PASS</div></div>
+    <div class="card"><b>Out of Sample CAGR</b><div class="metric">${pct(wf.metrics?.cagr)}</div><div class="hint">期間外のみ</div></div>
+    <div class="card"><b>Out of Sample DD</b><div class="metric warn">${pct(wf.metrics?.max_dd)}</div><div class="hint">期間外のみ</div></div>
+    <div class="card"><b>Best Allocation</b><div class="metric">${JSON.stringify((walkForward.best_allocation || {}))}</div><div class="hint">学習→検証で固定</div></div>
+  `;
+  const sensitivity = judgement.sensitivity || {};
+  const sensitivityRows = [
+    ['基準設定', sensitivity.base?.cagr],
+    ['少し緩い', sensitivity.loose?.cagr],
+    ['少し厳しい', sensitivity.tight?.cagr],
+    ['コスト2倍', sensitivity.cost_x2?.cagr],
+  ];
+  document.getElementById('research-sensitivity').innerHTML = `
+    <div><b>感度分析</b></div>
+    <div class="stack" style="margin-top:10px">
+      ${sensitivityRows.map(([label, value]) => `
+        <div class="card">
+          <b>${label}</b>
+          <div class="metric">${pct(value)}</div>
+          <div class="hint">${value != null && value > 0 ? '周辺でも利益が残る' : '中心だけが強い可能性があります'}</div>
+        </div>
+      `).join('')}
+    </div>
   `;
   const strategies = data.strategies || {};
   document.getElementById('research-strategies').innerHTML = Object.entries(strategies).map(([name, v]) => `
@@ -266,6 +344,16 @@ function renderResearch(data) {
   document.getElementById('research-meta').innerHTML = `
     <div>API budget note: ${data.meta?.api_budget_note || '-'}</div>
     <div class="hint">cache: ${data.meta?.cache_exists ? 'yes' : 'no'} / ${s.cache_path || '-'}</div>
+  `;
+  document.getElementById('research-api-estimate').innerHTML = `
+    <div>対象：${apiEstimate.target_symbols ?? '-'}銘柄</div>
+    <div>契約プラン：${apiEstimate.contract_plan || '-'}</div>
+    <div>API上限：${apiEstimate.api_limit_per_min ?? '-'} req/min</div>
+    <div>推定APIリクエスト：${apiEstimate.estimated_requests ?? '-'}</div>
+    <div>理論最短：約${apiEstimate.theoretical_min_minutes ?? '-'}分</div>
+    <div>推定所要時間：約${(apiEstimate.estimated_time_range_minutes || []).join('〜') || '-'}分</div>
+    <div>取得可能期間：${apiEstimate.available_period || '-'}</div>
+    <div class="hint">${apiEstimate.note || '-'}</div>
   `;
 }
 

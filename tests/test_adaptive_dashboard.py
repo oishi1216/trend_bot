@@ -45,7 +45,7 @@ def _create_dashboard_db(path):
                         "regime": "trend" if idx % 2 == 0 else "range",
                         "score": 78.0 + idx,
                         "action": "none" if idx else "enter_long",
-                        "reason": "no-entry: score below threshold"
+                        "reason": "Adaptive trend no-entry; score=0.0, strength_gap=0.31, ADX=25.0, vol_multiplier=1.00"
                         if idx
                         else "entry candidate",
                         "metadata": {"strength_gap": 0.31 + idx / 100},
@@ -108,7 +108,9 @@ def test_load_adaptive_dashboard_reads_sqlite_and_latest_json(tmp_path):
     assert dashboard.status["currency_rows"][0]["strength_gap"] == 0.31
     assert dashboard.status["currency_rows"][0]["is_candidate"] is True
     assert dashboard.status["currency_rows"][0]["is_action_candidate"] is True
-    assert dashboard.status["currency_rows"][1]["no_entry_reason_summary"] == "見送り：レンジ判定、反転条件未達"
+    assert dashboard.status["currency_rows"][0]["no_entry_reason_summary"] == "\u5019\u88dc\u3042\u308a\uff1a\u8cb7\u3044\u6761\u4ef6\u3092\u6e80\u305f\u3057\u3066\u3044\u307e\u3059"
+    assert dashboard.status["currency_rows"][1]["no_entry_reason_summary"] == "\u898b\u9001\u308a\uff1a\u30ec\u30f3\u30b8\u5224\u5b9a\u3001\u5019\u88dc\u6761\u4ef6\u306f\u3042\u308b\u304c\u6700\u7d42\u6761\u4ef6\u672a\u9054"
+    assert dashboard.status["currency_rows"][2]["no_entry_reason_summary"] == "\u898b\u9001\u308a\uff1a\u30c8\u30ec\u30f3\u30c9\u5224\u5b9a\u3001\u5019\u88dc\u6761\u4ef6\u306f\u3042\u308b\u304c\u6700\u7d42\u6761\u4ef6\u672a\u9054"
     assert dashboard.runs and len(dashboard.runs) == 2
     assert dashboard.runs[0]["has_candidate"] is True
     assert dashboard.latest_run["results"][0]["decision"]["action"] == "enter_long"

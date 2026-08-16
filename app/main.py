@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 
 from .config import Settings
 from .adaptive_dashboard import load_adaptive_dashboard
+from .research_dashboard import load_research_dashboard
 from .engine import TradingEngine
 from .feedback import FeedbackService
 from .storage import Storage
@@ -28,6 +29,8 @@ templates = Jinja2Templates(directory="app/templates")
 run_lock = asyncio.Lock()
 adaptive_db_path = "data/adaptive_paper.sqlite3"
 adaptive_task_log_dir = "data/task_logs"
+research_data_dir = "data/research"
+research_cache_path = "data/research/annual20_backtest.json"
 
 
 async def execute_run(force: bool = False):
@@ -118,6 +121,17 @@ def adaptive_status():
         "task_status": dashboard.task_status,
     }
 
+
+
+@app.get("/api/research/status")
+def research_status():
+    dashboard = load_research_dashboard(research_data_dir, research_cache_path, settings.paper_initial_balance)
+    return {
+        "status": dashboard.status,
+        "strategies": dashboard.strategies,
+        "portfolio": dashboard.portfolio,
+        "meta": dashboard.meta,
+    }
 
 @app.post("/api/run")
 async def run(force: bool = Query(default=False)):

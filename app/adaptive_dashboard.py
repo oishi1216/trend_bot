@@ -25,6 +25,38 @@ def _read_json_file(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _format_no_entry_reason(decision: dict[str, Any]) -> tuple[str, str]:
+    regime = decision.get("regime", "unknown")
+    action = decision.get("action")
+    status = str(decision.get("status") or "").lower()
+    score = float(decision.get("score") or 0)
+
+    regime_label = {
+        "unclear": "\u76f8\u5834\u65b9\u5411\u304c\u4e0d\u660e\u78ba",
+        "trend": "\u30c8\u30ec\u30f3\u30c9\u5224\u5b9a\u3001\u30a8\u30f3\u30c8\u30ea\u30fc\u6761\u4ef6\u672a\u9054",
+        "range": "\u30ec\u30f3\u30b8\u5224\u5b9a\u3001\u53cd\u8ee2\u6761\u4ef6\u672a\u9054",
+    }.get(regime, "\u30a8\u30f3\u30c8\u30ea\u30fc\u6761\u4ef6\u672a\u9054")
+
+    if action not in (None, "none"):
+        if action == "enter_long":
+            return "\u5019\u88dc\u3042\u308a\uff1a\u8cb7\u3044\u6761\u4ef6\u3092\u6e80\u305f\u3057\u3066\u3044\u307e\u3059", regime_label
+        if action == "enter_short":
+            return "\u5019\u88dc\u3042\u308a\uff1a\u58f2\u308a\u6761\u4ef6\u3092\u6e80\u305f\u3057\u3066\u3044\u307e\u3059", regime_label
+        return f"\u5019\u88dc\u3042\u308a\uff1a{action} \u6761\u4ef6\u3092\u6e80\u305f\u3057\u3066\u3044\u307e\u3059", regime_label
+
+    if regime == "trend":
+        if score > 0 or status in {"entry_blocked", "blocked"}:
+            return "\u898b\u9001\u308a\uff1a\u30c8\u30ec\u30f3\u30c9\u5224\u5b9a\u3001\u5019\u88dc\u6761\u4ef6\u306f\u3042\u308b\u304c\u6700\u7d42\u6761\u4ef6\u672a\u9054", regime_label
+        return "\u898b\u9001\u308a\uff1a\u30c8\u30ec\u30f3\u30c9\u5224\u5b9a\u3001\u30a8\u30f3\u30c8\u30ea\u30fc\u6761\u4ef6\u672a\u9054", regime_label
+    if regime == "range":
+        if score > 0:
+            return "\u898b\u9001\u308a\uff1a\u30ec\u30f3\u30b8\u5224\u5b9a\u3001\u5019\u88dc\u6761\u4ef6\u306f\u3042\u308b\u304c\u6700\u7d42\u6761\u4ef6\u672a\u9054", regime_label
+        return "\u898b\u9001\u308a\uff1a\u30ec\u30f3\u30b8\u5224\u5b9a\u3001\u53cd\u8ee2\u6761\u4ef6\u672a\u9054", regime_label
+    if score > 0:
+        return "\u898b\u9001\u308a\uff1a\u76f8\u5834\u65b9\u5411\u304c\u4e0d\u660e\u78ba\u3060\u304c\u5019\u88dc\u6761\u4ef6\u306f\u3042\u308b", regime_label
+    return "\u898b\u9001\u308a\uff1a\u76f8\u5834\u65b9\u5411\u304c\u4e0d\u660e\u78ba", regime_label
+
+
 def _latest_run_summary(event_row: sqlite3.Row) -> dict[str, Any]:
     payload = json.loads(event_row["payload"])
     results = payload.get("results", [])
@@ -45,10 +77,8 @@ def _latest_run_summary(event_row: sqlite3.Row) -> dict[str, Any]:
         "results": results,
     }
     task_result["has_candidate"] = any(
-        (
-            float(item.get("decision", {}).get("score") or 0) > 0
-            or item.get("decision", {}).get("action") not in (None, "none")
-        )
+        float(item.get("decision", {}).get("score") or 0) > 0
+        or item.get("decision", {}).get("action") not in (None, "none")
         for item in results
     )
     task_result["latest_action"] = next(
@@ -68,25 +98,19 @@ def _currency_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in results:
         decision = item.get("decision", {})
         metadata = decision.get("metadata", {}) or {}
-        regime = decision.get("regime", "unknown")
-        reason = decision.get("reason")
-        reason_summary = {
-            "unclear": "見送り：相場方向が不明確",
-            "trend": "見送り：トレンド判定、エントリー条件未達",
-            "range": "見送り：レンジ判定、反転条件未達",
-        }.get(regime, reason)
         score = float(decision.get("score") or 0)
         action = decision.get("action")
+        summary, regime_hint = _format_no_entry_reason(decision)
         rows.append(
             {
                 "instrument": item.get("instrument"),
-                "regime": regime,
+                "regime": decision.get("regime", "unknown"),
                 "score": score,
                 "strength_gap": metadata.get("strength_gap"),
                 "status": item.get("status"),
                 "action": action,
-                "no_entry_reason": reason,
-                "no_entry_reason_summary": reason_summary if action in (None, "none") else "候補あり",
+                "no_entry_reason": decision.get("reason"),
+                "no_entry_reason_summary": summary,
                 "is_candidate": score > 0 or action not in (None, "none"),
                 "is_action_candidate": action not in (None, "none"),
             }
@@ -169,9 +193,7 @@ def load_adaptive_dashboard(db_path: str, task_log_dir: str | None = None) -> Ad
                 {
                     "task_registered": True,
                     "last_run_time": latest_json.get("started_at"),
-                    "last_result": "success"
-                    if not latest_json.get("errors")
-                    else "failure",
+                    "last_result": "success" if not latest_json.get("errors") else "failure",
                     "last_result_meaning": "Success"
                     if not latest_json.get("errors")
                     else "Runtime or instrument error",
