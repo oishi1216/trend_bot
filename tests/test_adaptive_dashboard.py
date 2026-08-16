@@ -106,7 +106,11 @@ def test_load_adaptive_dashboard_reads_sqlite_and_latest_json(tmp_path):
     assert len(dashboard.status["currency_rows"]) == 10
     assert dashboard.status["currency_rows"][0]["regime"] == "trend"
     assert dashboard.status["currency_rows"][0]["strength_gap"] == 0.31
+    assert dashboard.status["currency_rows"][0]["is_candidate"] is True
+    assert dashboard.status["currency_rows"][0]["is_action_candidate"] is True
+    assert dashboard.status["currency_rows"][1]["no_entry_reason_summary"] == "見送り：レンジ判定、反転条件未達"
     assert dashboard.runs and len(dashboard.runs) == 2
+    assert dashboard.runs[0]["has_candidate"] is True
     assert dashboard.latest_run["results"][0]["decision"]["action"] == "enter_long"
     assert dashboard.task_status["task_registered"] is True
     assert dashboard.task_status["last_result"] == "success"

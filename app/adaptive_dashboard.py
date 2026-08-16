@@ -44,6 +44,13 @@ def _latest_run_summary(event_row: sqlite3.Row) -> dict[str, Any]:
         "currency_strength": payload.get("currency_strength", {}),
         "results": results,
     }
+    task_result["has_candidate"] = any(
+        (
+            float(item.get("decision", {}).get("score") or 0) > 0
+            or item.get("decision", {}).get("action") not in (None, "none")
+        )
+        for item in results
+    )
     task_result["latest_action"] = next(
         (
             item
@@ -61,15 +68,27 @@ def _currency_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for item in results:
         decision = item.get("decision", {})
         metadata = decision.get("metadata", {}) or {}
+        regime = decision.get("regime", "unknown")
+        reason = decision.get("reason")
+        reason_summary = {
+            "unclear": "見送り：相場方向が不明確",
+            "trend": "見送り：トレンド判定、エントリー条件未達",
+            "range": "見送り：レンジ判定、反転条件未達",
+        }.get(regime, reason)
+        score = float(decision.get("score") or 0)
+        action = decision.get("action")
         rows.append(
             {
                 "instrument": item.get("instrument"),
-                "regime": decision.get("regime", "unknown"),
-                "score": decision.get("score", 0.0),
+                "regime": regime,
+                "score": score,
                 "strength_gap": metadata.get("strength_gap"),
                 "status": item.get("status"),
-                "action": decision.get("action"),
-                "no_entry_reason": decision.get("reason"),
+                "action": action,
+                "no_entry_reason": reason,
+                "no_entry_reason_summary": reason_summary if action in (None, "none") else "候補あり",
+                "is_candidate": score > 0 or action not in (None, "none"),
+                "is_action_candidate": action not in (None, "none"),
             }
         )
     return rows
@@ -113,6 +132,7 @@ def load_adaptive_dashboard(db_path: str, task_log_dir: str | None = None) -> Ad
                     "started_at": run["started_at"],
                     "finished_at": run["finished_at"],
                     "status": run["status"],
+                    "has_candidate": run["has_candidate"],
                     "nav": run["nav"],
                     "drawdown": run["drawdown"],
                     "monthly_loss": run["monthly_loss"],

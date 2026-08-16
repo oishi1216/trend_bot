@@ -61,6 +61,16 @@
       padding: 14px;
       min-height: 82px;
     }
+    .card.highlight {
+      border-color: rgba(122, 167, 255, 0.55);
+      background: linear-gradient(180deg, rgba(122,167,255,0.14), rgba(255,255,255,0.04));
+      box-shadow: inset 0 0 0 1px rgba(122, 167, 255, 0.12), 0 12px 24px rgba(0,0,0,.18);
+    }
+    .card.strong-highlight {
+      border-color: rgba(126, 231, 135, 0.75);
+      background: linear-gradient(180deg, rgba(126,231,135,0.16), rgba(255,255,255,0.05));
+      box-shadow: inset 0 0 0 1px rgba(126, 231, 135, 0.18), 0 12px 24px rgba(0,0,0,.20);
+    }
     .card b { display: block; margin-bottom: 8px; color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
     .metric { font-size: 24px; font-weight: 700; }
     .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
@@ -82,6 +92,11 @@
     .stack { display: grid; gap: 12px; }
     .history-item { display: grid; gap: 6px; }
     .muted { color: var(--muted); }
+    .reason-detail { margin-top: 6px; display: block; color: var(--muted); }
+    .reason-detail summary { cursor: pointer; color: var(--text); }
+    .badge.good { border-color: rgba(126, 231, 135, 0.45); }
+    .badge.warn { border-color: rgba(255, 184, 107, 0.45); }
+    .badge.bad { border-color: rgba(255, 123, 114, 0.45); }
     @media (max-width: 720px) {
       header { flex-direction: column; }
       .shell { padding: 18px 12px 28px; }
@@ -101,6 +116,7 @@
 
   <div class="tabs">
     <button class="tab active" data-target="adaptive">Adaptive</button>
+    <button class="tab" data-target="research">Research</button>
     <button class="tab" data-target="legacy">Legacy</button>
   </div>
 
@@ -138,6 +154,22 @@
     </div>
   </section>
 
+  <section id="research" class="panel">
+    <div class="grid" id="research-summary"></div>
+    <div class="section">
+      <h2>Strategy Breakdown</h2>
+      <div class="card" id="research-strategies"></div>
+    </div>
+    <div class="section">
+      <h2>Portfolio</h2>
+      <div class="card" id="research-portfolio"></div>
+    </div>
+    <div class="section">
+      <h2>Notes</h2>
+      <div class="card" id="research-meta"></div>
+    </div>
+  </section>
+
   <section id="legacy" class="panel">
     <div class="grid" id="legacy-summary"></div>
     <div class="section">
@@ -154,7 +186,17 @@
 <script>
 const money = x => x == null ? '-' : Number(x).toLocaleString(undefined,{maximumFractionDigits:2});
 const pct = x => x == null ? '-' : (Number(x) * 100).toFixed(2) + '%';
-const dt = x => x ? String(x).replace('T', ' ').replace('+00:00', ' UTC') : '-';
+const dt = x => x ? new Intl.DateTimeFormat('ja-JP', {
+  timeZone: 'Asia/Tokyo',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+}).format(new Date(x)).replaceAll('/', '/') + ' JST' : '-';
+const badgeClass = value => value === 'failure' ? 'bad' : value === 'success' ? 'good' : 'warn';
+const reasonSummary = row => row.no_entry_reason_summary || row.no_entry_reason || '-';
 
 function renderAdaptive(data) {
   const s = data.status || {};
@@ -168,20 +210,26 @@ function renderAdaptive(data) {
 
   const rows = s.currency_rows || [];
   document.getElementById('adaptive-rows').innerHTML = rows.map(row => `
-    <tr>
+    <tr class="${row.is_action_candidate ? 'strong-highlight' : row.is_candidate ? 'highlight' : ''}">
       <td>${row.instrument || '-'}</td>
       <td>${row.regime || '-'}</td>
-      <td>${money(row.score)}</td>
+      <td>${row.score > 0 ? `<span class="badge good">score ${money(row.score)}</span>` : money(row.score)}</td>
       <td>${row.strength_gap == null ? '-' : Number(row.strength_gap).toFixed(2)}</td>
       <td>${row.status || '-'}</td>
-      <td>${row.action || '-'}</td>
-      <td>${row.no_entry_reason || '-'}</td>
+      <td>${row.action && row.action !== 'none' ? `<span class="badge good">${row.action}</span>` : '-'}</td>
+      <td>
+        <div>${reasonSummary(row)}</div>
+        <details class="reason-detail">
+          <summary>詳細</summary>
+          <div class="hint">${row.no_entry_reason || '-'}</div>
+        </details>
+      </td>
     </tr>
   `).join('') || '<tr><td colspan="7">データがありません</td></tr>';
 
   document.getElementById('adaptive-history').innerHTML = (data.runs || []).map(run => `
-    <div class="card history-item">
-      <div><span class="badge ${run.status === 'success' ? 'good' : 'bad'}">${run.status || '-'}</span> <span class="muted">${dt(run.started_at)} → ${dt(run.finished_at)}</span></div>
+    <div class="card history-item ${run.has_candidate ? 'highlight' : ''}">
+      <div><span class="badge ${badgeClass(run.status)}">${run.status || '-'}</span>${run.has_candidate ? ' <span class="badge good">候補あり</span>' : ''} <span class="muted">${dt(run.started_at)} → ${dt(run.finished_at)}</span></div>
       <div>NAV ${money(run.nav)} / Drawdown ${pct(run.drawdown)} / Monthly Loss ${pct(run.monthly_loss)} / Results ${run.results_count ?? '-'}</div>
     </div>
   `).join('') || '<div class="card">履歴がありません</div>';
@@ -189,6 +237,35 @@ function renderAdaptive(data) {
   document.getElementById('adaptive-task').innerHTML = `
     <div><b>task register</b> ${data.task_status?.task_registered ? 'Yes' : 'No'}</div>
     <div class="subtle">latest log updated: ${dt(data.task_status?.latest_log_updated)}</div>
+  `;
+}
+
+
+function renderResearch(data) {
+  const s = data.status || {};
+  const portfolio = data.portfolio || {};
+  document.getElementById('research-summary').innerHTML = `
+    <div class="card"><b>Mode</b><div class="metric">${s.mode || '-'}</div><div class="hint">${s.data_dir || '-'}</div></div>
+    <div class="card"><b>Universe</b><div class="metric">${s.universe_size ?? '-'}</div><div class="hint">loaded: ${s.loaded ? 'yes' : 'no'}</div></div>
+    <div class="card"><b>Portfolio CAGR</b><div class="metric ${Number(portfolio.metrics?.cagr || 0) >= 0 ? 'good' : 'bad'}">${pct(portfolio.metrics?.cagr)}</div></div>
+    <div class="card"><b>Portfolio DD</b><div class="metric warn">${pct(portfolio.metrics?.max_dd)}</div></div>
+  `;
+  const strategies = data.strategies || {};
+  document.getElementById('research-strategies').innerHTML = Object.entries(strategies).map(([name, v]) => `
+    <div class="card">
+      <b>${name}</b>
+      <div>Trades: ${v.metrics?.trades ?? 0} / PF: ${money(v.metrics?.pf)} / Win: ${pct(v.metrics?.win_rate)}</div>
+      <div class="hint">CAGR ${pct(v.metrics?.cagr)} / Max DD ${pct(v.metrics?.max_dd)} / Avg R ${money(v.metrics?.avg_r)}</div>
+    </div>`).join('') || '<div class="muted">戦略データがありません</div>';
+  document.getElementById('research-portfolio').innerHTML = `
+    <div>Trades: ${portfolio.metrics?.trades ?? 0}</div>
+    <div>PF: ${money(portfolio.metrics?.pf)} / Win: ${pct(portfolio.metrics?.win_rate)} / Avg R: ${money(portfolio.metrics?.avg_r)}</div>
+    <div>Top1 share: ${pct(portfolio.concentration?.top1_share)} / Top3 share: ${pct(portfolio.concentration?.top3_share)}</div>
+    <div class="hint">年次内訳: ${JSON.stringify(portfolio.annual || {})}</div>
+  `;
+  document.getElementById('research-meta').innerHTML = `
+    <div>API budget note: ${data.meta?.api_budget_note || '-'}</div>
+    <div class="hint">cache: ${data.meta?.cache_exists ? 'yes' : 'no'} / ${s.cache_path || '-'}</div>
   `;
 }
 
@@ -204,12 +281,14 @@ function renderLegacy(s, events) {
 }
 
 async function refresh() {
-  const [adaptive, legacy, legacyEvents] = await Promise.all([
+  const [adaptive, research, legacy, legacyEvents] = await Promise.all([
     fetch('/api/adaptive/status').then(r=>r.json()),
+    fetch('/api/research/status').then(r=>r.json()),
     fetch('/api/status').then(r=>r.json()),
     fetch('/api/events?limit=20').then(r=>r.json()),
   ]);
   renderAdaptive(adaptive);
+  renderResearch(research);
   renderLegacy(legacy, legacyEvents);
 }
 
