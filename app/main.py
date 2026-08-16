@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from .config import Settings
+from .adaptive_dashboard import load_adaptive_dashboard
 from .engine import TradingEngine
 from .feedback import FeedbackService
 from .storage import Storage
@@ -25,6 +26,8 @@ engine = TradingEngine(settings, storage)
 feedback_service = FeedbackService(settings, storage)
 templates = Jinja2Templates(directory="app/templates")
 run_lock = asyncio.Lock()
+adaptive_db_path = "data/adaptive_paper.sqlite3"
+adaptive_task_log_dir = "data/task_logs"
 
 
 async def execute_run(force: bool = False):
@@ -103,6 +106,17 @@ def status():
 @app.get("/api/events")
 def events(limit: int = Query(default=50, ge=1, le=500)):
     return storage.recent_events(limit)
+
+
+@app.get("/api/adaptive/status")
+def adaptive_status():
+    dashboard = load_adaptive_dashboard(adaptive_db_path, adaptive_task_log_dir)
+    return {
+        "status": dashboard.status,
+        "runs": dashboard.runs,
+        "latest_run": dashboard.latest_run,
+        "task_status": dashboard.task_status,
+    }
 
 
 @app.post("/api/run")

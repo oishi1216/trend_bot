@@ -1,52 +1,229 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="ja">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name }}</title>
   <style>
-    :root { font-family: system-ui, sans-serif; color-scheme: light dark; }
-    body { max-width: 1100px; margin: 0 auto; padding: 24px; }
-    header { display: flex; justify-content: space-between; gap: 16px; align-items: center; }
-    button { padding: 10px 16px; cursor: pointer; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap: 12px; }
-    .card { border: 1px solid #8886; border-radius: 12px; padding: 16px; }
-    .warning { border-left: 5px solid; padding: 12px; margin: 16px 0; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #8885; font-size: 14px; }
-    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-    .muted { opacity: .72; }
+    :root {
+      color-scheme: dark;
+      --bg: #0b1020;
+      --panel: rgba(13, 19, 38, 0.86);
+      --panel-strong: #121a33;
+      --line: rgba(255, 255, 255, 0.10);
+      --text: #eef2ff;
+      --muted: #95a2c6;
+      --accent: #58d6c5;
+      --accent-2: #7aa7ff;
+      --warn: #ffb86b;
+      --good: #7ee787;
+      --bad: #ff7b72;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(122, 167, 255, 0.18), transparent 30%),
+        radial-gradient(circle at top right, rgba(88, 214, 197, 0.18), transparent 28%),
+        linear-gradient(180deg, #08101d, #0c1122 50%, #090d18);
+    }
+    .shell { max-width: 1300px; margin: 0 auto; padding: 28px 20px 40px; }
+    header { display: flex; justify-content: space-between; gap: 20px; align-items: flex-start; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: 30px; letter-spacing: 0.02em; }
+    .subtle { color: var(--muted); margin-top: 6px; }
+    .tabs { display: flex; gap: 8px; margin: 18px 0; flex-wrap: wrap; }
+    .tab {
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 10px 16px;
+      cursor: pointer;
+    }
+    .tab.active { background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #08101d; font-weight: 700; }
+    .panel {
+      display: none;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      backdrop-filter: blur(14px);
+      border-radius: 20px;
+      padding: 18px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.24);
+    }
+    .panel.active { display: block; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(210px,1fr)); gap: 12px; }
+    .card {
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.04);
+      border-radius: 16px;
+      padding: 14px;
+      min-height: 82px;
+    }
+    .card b { display: block; margin-bottom: 8px; color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+    .metric { font-size: 24px; font-weight: 700; }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; overflow: hidden; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; font-size: 13px; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+    .section { margin-top: 16px; }
+    .section h2 { margin: 0 0 10px; font-size: 18px; }
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 10px; border-radius: 999px;
+      background: rgba(255,255,255,0.08); border: 1px solid var(--line);
+      font-size: 12px;
+    }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .warn { color: var(--warn); }
+    pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .stack { display: grid; gap: 12px; }
+    .history-item { display: grid; gap: 6px; }
+    .muted { color: var(--muted); }
+    @media (max-width: 720px) {
+      header { flex-direction: column; }
+      .shell { padding: 18px 12px 28px; }
+      h1 { font-size: 24px; }
+    }
   </style>
 </head>
 <body>
-<header>
-  <div><h1>{{ app_name }}</h1><div class="muted">日足トレンドフォロー自動売買 MVP</div></div>
-  <button id="run">今すぐ1回実行</button>
-</header>
-<div class="warning">実口座の利益を保証するものではありません。最初は paper または practice だけで検証してください。</div>
-<div id="summary" class="grid"></div>
-<h2>ポジション</h2>
-<div class="card"><table><thead><tr><th>通貨</th><th>方向</th><th>数量</th><th>建値</th><th>損切り</th><th>予定リスク</th></tr></thead><tbody id="positions"></tbody></table></div>
-<h2>最近のイベント</h2>
-<div id="events"></div>
+<div class="shell">
+  <header>
+    <div>
+      <h1>{{ app_name }}</h1>
+      <div class="subtle">Adaptive は読み取り専用で先頭表示します。Legacy は既存の見え方を壊さず残します。</div>
+    </div>
+    <div class="badge">完全読み取り専用</div>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" data-target="adaptive">Adaptive</button>
+    <button class="tab" data-target="legacy">Legacy</button>
+  </div>
+
+  <section id="adaptive" class="panel active">
+    <div class="grid" id="adaptive-summary"></div>
+
+    <div class="section">
+      <h2>10通貨の判定</h2>
+      <div class="card">
+        <table>
+          <thead>
+            <tr>
+              <th>通貨ペア</th>
+              <th>regime</th>
+              <th>score</th>
+              <th>strength_gap</th>
+              <th>status</th>
+              <th>action</th>
+              <th>no-entry reason</th>
+            </tr>
+          </thead>
+          <tbody id="adaptive-rows"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>直近の実行履歴</h2>
+      <div class="stack" id="adaptive-history"></div>
+    </div>
+
+    <div class="section">
+      <h2>補足</h2>
+      <div class="card" id="adaptive-task"></div>
+    </div>
+  </section>
+
+  <section id="legacy" class="panel">
+    <div class="grid" id="legacy-summary"></div>
+    <div class="section">
+      <h2>Open Positions</h2>
+      <div class="card"><table><thead><tr><th>instrument</th><th>side</th><th>units</th><th>entry_price</th><th>stop_price</th><th>planned_risk_home</th></tr></thead><tbody id="legacy-positions"></tbody></table></div>
+    </div>
+    <div class="section">
+      <h2>Recent Events</h2>
+      <div id="legacy-events" class="stack"></div>
+    </div>
+  </section>
+</div>
+
 <script>
 const money = x => x == null ? '-' : Number(x).toLocaleString(undefined,{maximumFractionDigits:2});
-async function refresh(){
-  const [s,e] = await Promise.all([fetch('/api/status').then(r=>r.json()), fetch('/api/events?limit=30').then(r=>r.json())]);
-  document.getElementById('summary').innerHTML = `
-    <div class="card"><b>モード</b><div>${s.mode}</div></div>
-    <div class="card"><b>新規取引</b><div>${s.trading_armed ? 'ARMED' : '停止中'}</div></div>
-    <div class="card"><b>NAV</b><div>${money(s.nav)}</div><small>${s.nav_error || ''}</small></div>
-    <div class="card"><b>ドローダウン</b><div>${s.drawdown == null ? '-' : (s.drawdown*100).toFixed(2)+'%'}</div></div>`;
-  document.getElementById('positions').innerHTML = s.positions.length ? s.positions.map(p=>`<tr><td>${p.instrument}</td><td>${p.side}</td><td>${p.units}</td><td>${p.entry_price}</td><td>${p.stop_price}</td><td>${money(p.planned_risk_home)}</td></tr>`).join('') : '<tr><td colspan="6">なし</td></tr>';
-  document.getElementById('events').innerHTML = e.map(x=>`<div class="card"><b>${x.kind}</b> <span class="muted">${x.ts} ${x.instrument||''}</span><pre>${JSON.stringify(x.payload,null,2)}</pre></div>`).join('');
+const pct = x => x == null ? '-' : (Number(x) * 100).toFixed(2) + '%';
+const dt = x => x ? String(x).replace('T', ' ').replace('+00:00', ' UTC') : '-';
+
+function renderAdaptive(data) {
+  const s = data.status || {};
+  const latest = data.latest_run || {};
+  document.getElementById('adaptive-summary').innerHTML = `
+    <div class="card"><b>NAV</b><div class="metric">${money(s.nav)}</div><div class="hint">strategy_profile: ${s.strategy_profile || '-'}</div></div>
+    <div class="card"><b>Drawdown</b><div class="metric ${Number(s.drawdown || 0) > 0 ? 'warn' : 'good'}">${pct(s.drawdown)}</div><div class="hint">Monthly Loss: ${pct(s.monthly_loss)}</div></div>
+    <div class="card"><b>Open Positions</b><div class="metric">${(s.positions || []).length}</div><div class="hint">現在の保有数</div></div>
+    <div class="card"><b>22:15 Auto Run</b><div class="metric ${data.task_status?.last_result === 'failure' ? 'bad' : 'good'}">${data.task_status?.last_result || 'unknown'}</div><div class="hint">${dt(data.task_status?.last_run_time)}</div></div>
+  `;
+
+  const rows = s.currency_rows || [];
+  document.getElementById('adaptive-rows').innerHTML = rows.map(row => `
+    <tr>
+      <td>${row.instrument || '-'}</td>
+      <td>${row.regime || '-'}</td>
+      <td>${money(row.score)}</td>
+      <td>${row.strength_gap == null ? '-' : Number(row.strength_gap).toFixed(2)}</td>
+      <td>${row.status || '-'}</td>
+      <td>${row.action || '-'}</td>
+      <td>${row.no_entry_reason || '-'}</td>
+    </tr>
+  `).join('') || '<tr><td colspan="7">データがありません</td></tr>';
+
+  document.getElementById('adaptive-history').innerHTML = (data.runs || []).map(run => `
+    <div class="card history-item">
+      <div><span class="badge ${run.status === 'success' ? 'good' : 'bad'}">${run.status || '-'}</span> <span class="muted">${dt(run.started_at)} → ${dt(run.finished_at)}</span></div>
+      <div>NAV ${money(run.nav)} / Drawdown ${pct(run.drawdown)} / Monthly Loss ${pct(run.monthly_loss)} / Results ${run.results_count ?? '-'}</div>
+    </div>
+  `).join('') || '<div class="card">履歴がありません</div>';
+
+  document.getElementById('adaptive-task').innerHTML = `
+    <div><b>task register</b> ${data.task_status?.task_registered ? 'Yes' : 'No'}</div>
+    <div class="subtle">latest log updated: ${dt(data.task_status?.latest_log_updated)}</div>
+  `;
 }
-document.getElementById('run').onclick = async ()=>{
-  const b=document.getElementById('run'); b.disabled=true; b.textContent='実行中…';
-  try { const r=await fetch('/api/run',{method:'POST'}); const j=await r.json(); if(!r.ok) throw new Error(JSON.stringify(j)); }
-  catch(e){ alert(e); } finally { b.disabled=false; b.textContent='今すぐ1回実行'; await refresh(); }
-};
-refresh(); setInterval(refresh, 30000);
+
+function renderLegacy(s, events) {
+  document.getElementById('legacy-summary').innerHTML = `
+    <div class="card"><b>Mode</b><div class="metric">${s.mode || '-'}</div></div>
+    <div class="card"><b>Trading Armed</b><div class="metric">${s.trading_armed ? 'ARMED' : 'OFF'}</div></div>
+    <div class="card"><b>NAV</b><div class="metric">${money(s.nav)}</div><div class="hint">${s.nav_error || ''}</div></div>
+    <div class="card"><b>Drawdown</b><div class="metric">${pct(s.drawdown)}</div></div>
+  `;
+  document.getElementById('legacy-positions').innerHTML = (s.positions || []).map(p=>`<tr><td>${p.instrument}</td><td>${p.side}</td><td>${p.units}</td><td>${p.entry_price}</td><td>${p.stop_price}</td><td>${money(p.planned_risk_home)}</td></tr>`).join('') || '<tr><td colspan="6">なし</td></tr>';
+  document.getElementById('legacy-events').innerHTML = (events || []).map(x=>`<div class="card"><b>${x.kind}</b> <span class="muted">${x.ts} ${x.instrument||''}</span><pre>${JSON.stringify(x.payload,null,2)}</pre></div>`).join('') || '<div class="card">イベントがありません</div>';
+}
+
+async function refresh() {
+  const [adaptive, legacy, legacyEvents] = await Promise.all([
+    fetch('/api/adaptive/status').then(r=>r.json()),
+    fetch('/api/status').then(r=>r.json()),
+    fetch('/api/events?limit=20').then(r=>r.json()),
+  ]);
+  renderAdaptive(adaptive);
+  renderLegacy(legacy, legacyEvents);
+}
+
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById(btn.dataset.target).classList.add('active');
+  });
+});
+
+refresh();
+setInterval(refresh, 30000);
 </script>
 </body>
 </html>
