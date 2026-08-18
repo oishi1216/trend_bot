@@ -4,8 +4,8 @@ import argparse
 import json
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 from typing import Any, Callable, Mapping
@@ -14,7 +14,7 @@ import pandas as pd
 
 from .adaptive_strategy import currency_strength_scores, decide, strength_gap
 from .config import Settings
-from .instruments import quote_currency
+from .instruments import base_currency, quote_currency
 from .models import Position
 
 # Stage 1 explicit transaction-cost assumptions (round-trip cost is split
@@ -62,6 +62,20 @@ def _common_dates(candles_by_instrument: Mapping[str, pd.DataFrame]) -> list[str
     return sorted(common)
 
 
+def _mark_to_market(
+    trade: _OpenTrade,
+    close_price: float,
+) -> float:
+    direction = 1 if trade.side == "long" else -1
+    return (close_price - trade.entry_price) * direction * trade.price_per_risk_unit
+
+
+def _select_highest_candidate(
+    candidates: list[tuple[str, Any, float, float]],
+) -> tuple[str, Any, float, float] | None:
+    return max(candidates, key=lambda item: item[2]) if candidates else None
+
+
 def _simulate(
     candles_by_instrument: Mapping[str, pd.DataFrame],
     settings: Settings,
@@ -89,6 +103,23 @@ def _simulate(
     equity_dates: list[str] = []
     trades: list[dict[str, Any]] = []
     open_trades: dict[str, _OpenTrade] = {}
+    candidate_dates: list[str] = []
+    open_positions_before_date: dict[str, list[str]] = {}
+    open_positions_by_date: dict[str, list[str]] = {}
+    diagnostics = {
+        "candidate_days": 0,
+        "multi_candidate_days": 0,
+        "selected_candidates": 0,
+        "blocked_max_positions": 0,
+        "blocked_monthly_loss": 0,
+        "blocked_dd_stop": 0,
+        "reduced_dd_4": 0,
+        "reduced_dd_7": 0,
+        "blocked_aggregate_risk": 0,
+        "blocked_currency_risk": 0,
+    }
+    high_water = equity
+    month_start_nav: dict[str, float] = {}
 
     def _close_trade(instrument: str, fill: float, current_date: str, reason: str) -> None:
         nonlocal equity
@@ -112,10 +143,9 @@ def _simulate(
                 "exit_reason": reason,
             }
         )
-        equity_curve.append(equity)
-        equity_dates.append(current_date)
 
     for current_date in dates:
+        open_positions_before_date[current_date] = sorted(open_trades)
         slices: dict[str, pd.DataFrame] = {}
         for instrument, df in sorted_frames.items():
             sliced = df[df["time"] <= current_date]
@@ -125,8 +155,24 @@ def _simulate(
         if not slices:
             continue
 
+        current_nav = equity + sum(
+            _mark_to_market(trade, float(slices[trade.instrument].iloc[-1]["close"]))
+            for trade in open_trades.values()
+            if trade.instrument in slices
+        )
+        high_water = max(high_water, current_nav)
+        month = current_date[:7]
+        month_start_nav.setdefault(month, current_nav)
+        monthly_loss = max(
+            0.0,
+            1.0 - current_nav / month_start_nav[month]
+            if month_start_nav[month] > 0
+            else 0.0,
+        )
+        drawdown = max(0.0, 1.0 - current_nav / high_water) if high_water > 0 else 0.0
+
         strengths = currency_strength_scores(slices, settings)
-        candidates: list[tuple[str, Any]] = []
+        candidates: list[tuple[str, Any, float, float]] = []
 
         for instrument, sliced in slices.items():
             row = sliced.iloc[-1]
@@ -204,28 +250,88 @@ def _simulate(
                 continue
 
             if decision.action in {"enter_long", "enter_short"}:
-                candidates.append((instrument, decision))
-
-        remaining_slots = settings.adaptive_max_open_positions - len(open_trades)
-        if remaining_slots > 0 and candidates:
-            candidates.sort(key=lambda item: item[1].score, reverse=True)
-            for instrument, decision in candidates[:remaining_slots]:
-                row = slices[instrument].iloc[-1]
-                close = float(row["close"])
-                side = "long" if decision.action == "enter_long" else "short"
-                stop_multiple = decision.stop_atr_multiple or settings.atr_stop_multiple
-                stop_price = (
-                    close - stop_multiple * decision.atr
-                    if side == "long"
-                    else close + stop_multiple * decision.atr
+                nav_snapshot = equity + sum(
+                    _mark_to_market(
+                        trade,
+                        float(slices[trade.instrument].iloc[-1]["close"]),
+                    )
+                    for trade in open_trades.values()
+                    if trade.instrument in slices
                 )
-                stop_distance = abs(close - stop_price)
+                candidates.append(
+                    (
+                        instrument,
+                        decision,
+                        float(decision.score),
+                        nav_snapshot,
+                    )
+                )
+
+        if candidates:
+            candidate_dates.append(current_date)
+            diagnostics["candidate_days"] += 1
+            diagnostics["multi_candidate_days"] += int(len(candidates) > 1)
+            selected = _select_highest_candidate(candidates)
+            assert selected is not None
+            instrument, decision, _, nav_snapshot = selected
+            diagnostics["selected_candidates"] += 1
+            if settings.adaptive_enabled:
                 risk_fraction = float(decision.risk_fraction or 0.0)
-                if stop_distance <= 0 or risk_fraction <= 0:
+                if monthly_loss >= settings.adaptive_monthly_loss_limit:
+                    diagnostics["blocked_monthly_loss"] += 1
                     continue
+                if drawdown >= settings.adaptive_drawdown_stop:
+                    diagnostics["blocked_dd_stop"] += 1
+                    continue
+                if drawdown >= settings.adaptive_drawdown_reduce_2:
+                    diagnostics["reduced_dd_7"] += 1
+                    risk_fraction = min(risk_fraction, 0.0025)
+                elif drawdown >= settings.adaptive_drawdown_reduce_1:
+                    diagnostics["reduced_dd_4"] += 1
+                    risk_fraction *= 0.5
+                if len(open_trades) >= settings.adaptive_max_open_positions:
+                    diagnostics["blocked_max_positions"] += 1
+                    continue
+                if (
+                    nav_snapshot > 0
+                    and sum(trade.risk_dollars for trade in open_trades.values())
+                    + risk_fraction * nav_snapshot
+                    > nav_snapshot * settings.adaptive_max_aggregate_risk
+                ):
+                    diagnostics["blocked_aggregate_risk"] += 1
+                    continue
+                same_currency_risk = sum(
+                    trade.risk_dollars
+                    for trade in open_trades.values()
+                    if {
+                        base_currency(trade.instrument),
+                        quote_currency(trade.instrument),
+                    }
+                    & {base_currency(instrument), quote_currency(instrument)}
+                )
+                if (
+                    nav_snapshot > 0
+                    and same_currency_risk + risk_fraction * nav_snapshot
+                    > nav_snapshot * settings.adaptive_max_single_currency_risk
+                ):
+                    diagnostics["blocked_currency_risk"] += 1
+                    continue
+                decision = replace(decision, risk_fraction=risk_fraction)
+            row = slices[instrument].iloc[-1]
+            close = float(row["close"])
+            side = "long" if decision.action == "enter_long" else "short"
+            stop_multiple = decision.stop_atr_multiple or settings.atr_stop_multiple
+            stop_price = (
+                close - stop_multiple * decision.atr
+                if side == "long"
+                else close + stop_multiple * decision.atr
+            )
+            stop_distance = abs(close - stop_price)
+            risk_fraction = float(decision.risk_fraction or 0.0)
+            if stop_distance > 0 and risk_fraction > 0:
                 cost = _adverse_cost(instrument, spread_pips, slippage_pips)
                 entry_price = close + cost if side == "long" else close - cost
-                risk_dollars = risk_fraction * equity
+                risk_dollars = risk_fraction * nav_snapshot
                 open_trades[instrument] = _OpenTrade(
                     instrument=instrument,
                     side=side,
@@ -241,12 +347,25 @@ def _simulate(
                     price_per_risk_unit=risk_dollars / stop_distance,
                 )
 
+        current_equity = equity + sum(
+            _mark_to_market(trade, float(slices[trade.instrument].iloc[-1]["close"]))
+            for trade in open_trades.values()
+            if trade.instrument in slices
+        )
+        equity_curve.append(current_equity)
+        equity_dates.append(current_date)
+        open_positions_by_date[current_date] = sorted(open_trades)
+
     return {
         "trades": trades,
         "equity_curve": equity_curve,
         "equity_dates": equity_dates,
         "final_equity": equity,
         "dates": dates,
+        "diagnostics": diagnostics,
+        "candidate_dates": candidate_dates,
+        "open_positions_before_date": open_positions_before_date,
+        "open_positions_by_date": open_positions_by_date,
     }
 
 
@@ -261,11 +380,11 @@ def _max_dd(equity: list[float]) -> float:
 
 
 def _cagr(equity_first: float, equity_last: float, start_date: str | None, end_date: str | None) -> float:
-    if equity_first <= 0 or not start_date or not end_date:
+    if equity_first <= 0 or equity_last <= 0 or not start_date or not end_date:
         return 0.0
     d0 = datetime.fromisoformat(start_date)
     d1 = datetime.fromisoformat(end_date)
-    days = max(1, (d1 - d0).days)
+    days = max(1, (d1 - d0).days + 1)
     years = days / 365.25
     if years <= 0:
         return 0.0
@@ -277,12 +396,19 @@ def _metrics(
     equity_curve: list[float],
     start_date: str | None,
     end_date: str | None,
+    *,
+    equity_first: float | None = None,
+    equity_last: float | None = None,
 ) -> dict[str, Any]:
     gp = sum(t["pnl"] for t in trades if t["pnl"] > 0)
     gl = abs(sum(t["pnl"] for t in trades if t["pnl"] < 0))
     wins = [t for t in trades if t["pnl"] > 0]
-    equity_first = equity_curve[0] if equity_curve else 0.0
-    equity_last = equity_curve[-1] if equity_curve else equity_first
+    equity_first = (
+        equity_curve[0] if equity_first is None and equity_curve else equity_first or 0.0
+    )
+    equity_last = (
+        equity_curve[-1] if equity_last is None and equity_curve else equity_last or equity_first
+    )
     # pf is left as None (not float("inf")) when there are winners but no
     # losers, since "Infinity" is not valid JSON and would break the
     # dashboard's fetch(...).json() call.
@@ -408,9 +534,25 @@ def run_research(
     dates = base["dates"]
     start_date = dates[0] if dates else None
     end_date = dates[-1] if dates else None
-    metrics = _metrics(trades, base["equity_curve"], start_date, end_date)
+    metrics = _metrics(
+        trades,
+        base["equity_curve"],
+        start_date,
+        end_date,
+        equity_first=initial_equity,
+        equity_last=base["equity_curve"][-1] if base["equity_curve"] else initial_equity,
+    )
     high_cost_metrics = _metrics(
-        high_cost["trades"], high_cost["equity_curve"], start_date, end_date
+        high_cost["trades"],
+        high_cost["equity_curve"],
+        start_date,
+        end_date,
+        equity_first=initial_equity,
+        equity_last=(
+            high_cost["equity_curve"][-1]
+            if high_cost["equity_curve"]
+            else initial_equity
+        ),
     )
 
     train_dates, validation_dates, test_dates = _split_dates(dates)
@@ -418,13 +560,59 @@ def run_research(
     def _period_result(period_dates: set[str]) -> dict[str, Any]:
         subset = [t for t in trades if t["exit_date"] in period_dates]
         subset_equity = [
-            e for e, d in zip(base["equity_curve"], base["equity_dates"]) if d in period_dates
+            e
+            for e, d in zip(base["equity_curve"], base["equity_dates"])
+            if d in period_dates
         ]
         p_start = min(period_dates) if period_dates else None
         p_end = max(period_dates) if period_dates else None
+        included_indexes = [
+            index
+            for index, date in enumerate(base["equity_dates"])
+            if date in period_dates
+        ]
+        first_index = included_indexes[0] if included_indexes else None
+        last_index = included_indexes[-1] if included_indexes else None
+        period_start_equity = (
+            initial_equity
+            if first_index in {None, 0}
+            else base["equity_curve"][first_index - 1]
+        )
+        period_end_equity = (
+            base["equity_curve"][last_index]
+            if last_index is not None
+            else period_start_equity
+        )
+        carry_in_symbols = (
+            base["open_positions_before_date"].get(p_start, []) if p_start else []
+        )
+        carry_out_symbols = (
+            base["open_positions_by_date"].get(
+                base["equity_dates"][last_index], []
+            )
+            if last_index is not None
+            else []
+        )
         return {
             "trades": len(subset),
-            "metrics": _metrics(subset, subset_equity, p_start, p_end),
+            "closed_trades": len(subset),
+            "candidate_days": len(
+                set(base["candidate_dates"]) & period_dates
+            ),
+            "carry_in_symbols": (
+                carry_in_symbols
+            ),
+            "carry_out_symbols": (
+                carry_out_symbols
+            ),
+            "metrics": _metrics(
+                subset,
+                subset_equity,
+                p_start,
+                p_end,
+                equity_first=period_start_equity,
+                equity_last=period_end_equity,
+            ),
             "annual": _annual(subset),
         }
 
@@ -475,6 +663,9 @@ def run_research(
             "folds": folds,
             "fold_positive": fold_positive,
             "fold_total": len(folds),
+            "mode": "continuous_state_period_slice",
+            "trade_attribution": "exit_date",
+            "state_reset_between_folds": False,
         },
         "cost_assumptions": {
             "base_spread_pips": DEFAULT_SPREAD_PIPS,

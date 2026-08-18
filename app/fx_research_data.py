@@ -73,6 +73,7 @@ def sync_history(
 
     results: dict[str, dict[str, Any]] = {}
     synced_at = datetime.now(timezone.utc).isoformat()
+    latest_times: list[str] = []
     for instrument in instruments:
         path = _instrument_path(root, instrument)
         if instrument not in candles_by_instrument:
@@ -88,6 +89,9 @@ def sync_history(
         candles = candles_by_instrument[instrument]
         new_bars = candles.to_dict(orient="records")
         merged = _merge_bars(_load_instrument_file(path), new_bars)
+        last_time = merged[-1]["time"] if merged else None
+        if last_time:
+            latest_times.append(str(last_time))
         path.write_text(
             json.dumps(
                 {
@@ -105,7 +109,22 @@ def sync_history(
             "synced": True,
             "count": len(merged),
             "first_time": merged[0]["time"] if merged else None,
-            "last_time": merged[-1]["time"] if merged else None,
+            "last_time": last_time,
+        }
+    if latest_times:
+        newest = max(latest_times)
+        results["_freshness"] = {
+            "latest_completed_time": newest,
+            "lagging_symbols": [
+                instrument
+                for instrument in instruments
+                if results.get(instrument, {}).get("last_time") not in {None, newest}
+            ],
+            "all_symbols_current": all(
+                results.get(instrument, {}).get("last_time") == newest
+                for instrument in instruments
+                if results.get(instrument, {}).get("synced")
+            ),
         }
     return results
 
@@ -133,6 +152,7 @@ def data_status(
     root = Path(data_dir)
     per_symbol: dict[str, Any] = {}
     last_updates: list[datetime] = []
+    last_times: list[str] = []
     for instrument in instruments:
         path = _instrument_path(root, instrument)
         if not path.exists():
@@ -154,10 +174,21 @@ def data_status(
             "last_time": bars[-1]["time"] if bars else None,
             "updated_at": updated_at.isoformat(),
         }
+        if bars:
+            last_times.append(str(bars[-1]["time"]))
+    latest_completed_time = max(last_times) if last_times else None
+    lagging_symbols = [
+        instrument
+        for instrument, info in per_symbol.items()
+        if info["last_time"] is None or info["last_time"] != latest_completed_time
+    ]
     return {
         "data_dir": str(root),
         "instruments": per_symbol,
         "last_update": max(last_updates).isoformat() if last_updates else None,
+        "latest_completed_time": latest_completed_time,
+        "lagging_symbols": lagging_symbols,
+        "stale": bool(lagging_symbols or not all(v["available"] for v in per_symbol.values())),
         "all_synced": (
             all(v["available"] for v in per_symbol.values()) if per_symbol else False
         ),

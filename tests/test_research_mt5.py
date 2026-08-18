@@ -167,6 +167,8 @@ def test_data_status_reports_counts_and_last_update(tmp_path):
     assert status["instruments"]["EURUSD"]["available"] is False
     assert status["all_synced"] is False
     assert status["last_update"] is not None
+    assert status["stale"] is True
+    assert status["lagging_symbols"] == ["EURUSD"]
 
 
 def test_mt5_client_connection_check_reports_status(monkeypatch):

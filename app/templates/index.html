@@ -236,10 +236,11 @@
       <div class="grid" id="research-splits"></div>
     </div>
     <div class="section">
-      <h2>Walk-forward</h2>
+      <h2>Walk-forward / Sequential Period Summary</h2>
       <div class="card">
+        <div class="hint">Continuous-state replay. Portfolio state is not reset between folds. Closed trades are attributed by exit date.</div>
         <table>
-          <thead><tr><th>fold</th><th>dates</th><th>trades</th><th>CAGR</th><th>max DD</th></tr></thead>
+          <thead><tr><th>fold</th><th>dates</th><th>closed trades</th><th>candidate days</th><th>carry-in</th><th>carry-out</th><th>CAGR</th><th>max DD</th></tr></thead>
           <tbody id="research-walkforward"></tbody>
         </table>
       </div>
@@ -398,8 +399,8 @@ function renderResearch(data) {
 
   const walkForward = data.walk_forward || {};
   document.getElementById('research-walkforward').innerHTML = (walkForward.folds || []).map(fold => `
-    <tr><td>${fold.fold}</td><td>${fold.dates}</td><td>${fold.trades}</td><td>${pct(fold.metrics?.cagr)}</td><td>${pct(fold.metrics?.max_dd)}</td></tr>
-  `).join('') || '<tr><td colspan="5">データがありません</td></tr>';
+    <tr><td>${fold.fold}</td><td>${fold.dates}</td><td>${fold.closed_trades ?? fold.trades ?? 0}</td><td>${fold.candidate_days ?? 0}</td><td>${(fold.carry_in_symbols || []).length}</td><td>${(fold.carry_out_symbols || []).length}</td><td>${pct(fold.metrics?.cagr)}</td><td>${pct(fold.metrics?.max_dd)}</td></tr>
+  `).join('') || '<tr><td colspan="8">データがありません</td></tr>';
 
   const meta = data.meta || {};
   document.getElementById('research-meta').innerHTML = `

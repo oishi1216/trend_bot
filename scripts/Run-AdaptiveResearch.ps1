@@ -1,6 +1,6 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 
-$projectPath = "C:\Users\abdaq\trend_bot"
+$projectPath = Split-Path -Parent $PSScriptRoot
 $pythonPath = Join-Path $projectPath ".venv\Scripts\python.exe"
 $mt5Path = "C:\Program Files\OANDA MetaTrader 5\terminal64.exe"
 $logDirectory = Join-Path $projectPath "data\task_logs"

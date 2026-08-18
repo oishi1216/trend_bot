@@ -10,7 +10,16 @@ import pandas as pd
 import app.adaptive_strategy as adaptive_strategy
 import app.research_backtest as research_backtest
 from app.config import Settings
-from app.research_backtest import _group_metrics, _score_band, _simulate, run_research
+from app.research_backtest import (
+    _cagr,
+    _group_metrics,
+    _max_dd,
+    _metrics,
+    _select_highest_candidate,
+    _score_band,
+    _simulate,
+    run_research,
+)
 from app.research_dashboard import load_research_dashboard
 
 
@@ -181,8 +190,96 @@ def test_run_research_reports_required_breakdowns():
     for split in ("train", "validation", "test"):
         assert "metrics" in payload[split]
     assert "folds" in payload["walk_forward"]
+    assert payload["walk_forward"]["mode"] == "continuous_state_period_slice"
+    assert payload["walk_forward"]["trade_attribution"] == "exit_date"
+    assert payload["walk_forward"]["state_reset_between_folds"] is False
+    for fold in payload["walk_forward"]["folds"]:
+        assert fold["trades"] == fold["closed_trades"]
     assert payload["baseline_config"]["adaptive_strength_gap_min"] == 0.3
     assert payload["baseline_config"]["adaptive_score_min"] == 70.0
+
+
+def test_simulate_builds_daily_equity_curve():
+    settings = _fast_settings()
+    candles = _multi_instrument_candles(rows=240, breakout_at=180, crash_at=181)
+    result = _simulate(
+        candles,
+        settings,
+        initial_equity=1_000_000.0,
+        spread_pips=1.0,
+        slippage_pips=0.3,
+    )
+
+    assert len(result["equity_curve"]) == len(result["dates"])
+    assert len(result["equity_dates"]) == len(result["dates"])
+    assert result["equity_curve"][0] != result["equity_curve"][-1]
+
+
+def test_cagr_is_anchored_to_initial_equity_and_profit_sign():
+    start = "2020-01-01T00:00:00+00:00"
+    end = "2021-01-01T00:00:00+00:00"
+    cagr = _cagr(1_000_000.0, 1_100_000.0, start, end)
+    assert cagr > 0
+    assert _cagr(1_000_000.0, 900_000.0, start, end) < 0
+
+
+def test_candidate_ranking_precedes_risk_gate_without_fallback():
+    blocked_high = ("USDJPY", object(), 95.0, 1_000_000.0)
+    allowed_low = ("EURUSD", object(), 80.0, 1_000_000.0)
+    selected = _select_highest_candidate([blocked_high, allowed_low])
+    assert selected is blocked_high
+
+
+def test_period_metrics_use_boundary_nav_and_keep_profit_sign():
+    metrics = _metrics(
+        [{"pnl": 100.0, "r": 1.0}],
+        [1_000_000.0, 1_100_000.0],
+        "2020-01-02T00:00:00+00:00",
+        "2021-01-01T00:00:00+00:00",
+        equity_first=1_000_000.0,
+        equity_last=1_100_000.0,
+    )
+    assert metrics["profit"] > 0
+    assert metrics["cagr"] > 0
+
+
+def test_daily_nav_marks_open_position_and_drawdown():
+    settings = _fast_settings()
+    candles = _multi_instrument_candles(rows=240, breakout_at=180, crash_at=181)
+    result = _simulate(
+        candles,
+        settings,
+        initial_equity=1_000_000.0,
+        spread_pips=1.0,
+        slippage_pips=0.3,
+    )
+    assert len(result["equity_curve"]) == len(result["equity_dates"])
+    assert max(result["equity_curve"]) > min(result["equity_curve"])
+    assert _max_dd(result["equity_curve"]) > 0
+
+
+def test_research_gate_diagnostics_are_deterministic():
+    settings = _fast_settings()
+    candles = _multi_instrument_candles(rows=300, breakout_at=220, crash_at=221)
+    result = _simulate(
+        candles,
+        settings,
+        initial_equity=1_000_000.0,
+        spread_pips=1.0,
+        slippage_pips=0.3,
+    )
+    assert result["diagnostics"] == {
+        "candidate_days": 1,
+        "multi_candidate_days": 1,
+        "selected_candidates": 1,
+        "blocked_max_positions": 0,
+        "blocked_monthly_loss": 0,
+        "blocked_dd_stop": 0,
+        "reduced_dd_4": 0,
+        "reduced_dd_7": 0,
+        "blocked_aggregate_risk": 0,
+        "blocked_currency_risk": 0,
+    }
 
 
 def test_score_band_uses_configured_thresholds():
