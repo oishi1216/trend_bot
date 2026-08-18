@@ -80,6 +80,64 @@ class Mt5Client:
         finally:
             mt5.shutdown()
 
+    def connection_check(self) -> dict[str, Any]:
+        mt5 = self.connect()
+        try:
+            account = mt5.account_info()
+            terminal = mt5.terminal_info()
+            return {
+                "connected": True,
+                "login": getattr(account, "login", None) if account else None,
+                "server": getattr(account, "server", None) if account else None,
+                "terminal_connected": (
+                    bool(getattr(terminal, "connected", False))
+                    if terminal
+                    else None
+                ),
+            }
+        finally:
+            mt5.shutdown()
+
+    def candles_batch(
+        self, instruments: Any, count: int | None = None
+    ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+        """Fetch D1 candles for multiple instruments within a single MT5 session.
+
+        Returns (candles_by_instrument, errors_by_instrument) so a failure on
+        one symbol does not abort the whole batch, mirroring the per-instrument
+        error handling already used by the forward engine.
+        """
+        requested = count or self.settings.market_data_candle_count
+        mt5 = self.connect()
+        candles_by_instrument: dict[str, pd.DataFrame] = {}
+        errors_by_instrument: dict[str, str] = {}
+        try:
+            for instrument in instruments:
+                try:
+                    if not mt5.symbol_select(instrument, True):
+                        raise Mt5Error(
+                            f"MT5 symbol_select failed for {instrument}: {mt5.last_error()}"
+                        )
+                    rates = mt5.copy_rates_from_pos(
+                        instrument,
+                        mt5.TIMEFRAME_D1,
+                        0,
+                        requested + 1,
+                    )
+                    if rates is None:
+                        raise Mt5Error(
+                            f"MT5 copy_rates_from_pos failed for {instrument}: {mt5.last_error()}"
+                        )
+                    candles = self.rates_to_dataframe(rates)
+                    if candles.empty:
+                        raise Mt5Error(f"No complete MT5 candles for {instrument}")
+                    candles_by_instrument[instrument] = candles
+                except Mt5Error as exc:
+                    errors_by_instrument[instrument] = str(exc)
+        finally:
+            mt5.shutdown()
+        return candles_by_instrument, errors_by_instrument
+
     def _tick(self, instrument: str):
         mt5 = self.connect()
         try:
