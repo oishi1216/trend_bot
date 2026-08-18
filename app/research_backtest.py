@@ -50,6 +50,7 @@ class _OpenTrade:
     risk_fraction: float
     risk_dollars: float
     price_per_risk_unit: float
+    strength_gap: float
 
 
 def _common_dates(candles_by_instrument: Mapping[str, pd.DataFrame]) -> list[str]:
@@ -137,10 +138,13 @@ def _simulate(
                 "entry_date": trade.opened_at,
                 "exit_date": current_date,
                 "entry_price": trade.entry_price,
+                "initial_stop_price": trade.initial_stop_price,
                 "exit_price": fill,
                 "pnl": pnl,
                 "r": pnl / trade.risk_dollars if trade.risk_dollars else 0.0,
                 "exit_reason": reason,
+                "strength_gap": trade.strength_gap,
+                "risk_fraction": trade.risk_fraction,
             }
         )
 
@@ -345,6 +349,7 @@ def _simulate(
                     risk_fraction=risk_fraction,
                     risk_dollars=risk_dollars,
                     price_per_risk_unit=risk_dollars / stop_distance,
+                    strength_gap=float(strength_gap(instrument, strengths)),
                 )
 
         current_equity = equity + sum(
