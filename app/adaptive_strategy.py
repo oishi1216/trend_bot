@@ -224,6 +224,7 @@ def _manage_position(
     df: pd.DataFrame,
     position: Position,
     metadata: Mapping[str, Any] | None,
+    settings: Any,
 ) -> StrategyDecision:
     row = df.iloc[-1]
     close = float(row["close"])
@@ -244,7 +245,7 @@ def _manage_position(
     bars_held = _position_bars(df, metadata)
 
     updated_stop: float | None = None
-    if reward_r >= 1.0:
+    if reward_r >= settings.adaptive_breakeven_trigger_r:
         breakeven = position.entry_price
         updated_stop = (
             max(position.stop_price, breakeven)
@@ -360,7 +361,7 @@ def decide(
         raise ValueError("Latest adaptive indicators contain NaN")
 
     if position:
-        return _manage_position(df, position, position_metadata)
+        return _manage_position(df, position, position_metadata, settings)
 
     close = float(row["close"])
     atr = float(row["atr"])
