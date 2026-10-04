@@ -83,6 +83,7 @@ class Settings:
     adaptive_drawdown_reduce_1: float
     adaptive_drawdown_reduce_2: float
     adaptive_drawdown_stop: float
+    adaptive_breakeven_trigger_r: float
     adaptive_max_spread_pips: float
     paper_initial_balance: float
     paper_spread_pips: float
@@ -225,6 +226,7 @@ class Settings:
                 "ADAPTIVE_DRAWDOWN_REDUCE_2", 0.07
             ),
             adaptive_drawdown_stop=_float("ADAPTIVE_DRAWDOWN_STOP", 0.10),
+            adaptive_breakeven_trigger_r=_float("ADAPTIVE_BREAKEVEN_TRIGGER_R", 1.0),
             adaptive_max_spread_pips=_float("ADAPTIVE_MAX_SPREAD_PIPS", 3.0),
             paper_initial_balance=_float("PAPER_INITIAL_BALANCE", 1_000_000),
             paper_spread_pips=_float("PAPER_SPREAD_PIPS", 1.0),
