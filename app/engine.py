@@ -4,6 +4,7 @@ import json
 import logging
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .adaptive_strategy import (
@@ -17,6 +18,14 @@ from .models import Position, StrategyDecision
 from .mt5_client import Mt5Client
 from .oanda import OandaClient
 from .paper import PaperBroker
+from .recovery_authority import (
+    RECOVERY_LATCH_DRAWDOWN_STOP_V1,
+    RECOVERY_SCHEMA_VERSION,
+    STATE_ACTIVE,
+    calculate_drawdown,
+    parse_positive_float_text,
+    resolve_source_commit,
+)
 from .risk import calculate_units
 from .storage import Storage
 from .strategy import decide as decide_legacy
@@ -68,7 +77,11 @@ class TradingEngine:
     def _is_paper_mode(self) -> bool:
         return self.settings.broker_mode in {"paper", "mt5_paper"}
 
-    def _entries_enabled(self) -> tuple[bool, str]:
+    def _entries_enabled(
+        self, recovery: dict[str, Any] | None = None
+    ) -> tuple[bool, str]:
+        if recovery and recovery.get("governed") and recovery.get("entries_blocked"):
+            return False, str(recovery.get("block_reason") or "recovery blocked")
         if not self.settings.trading_armed:
             return False, "TRADING_ARMED is false"
         if self.settings.adaptive_enabled and not self._is_paper_mode():
@@ -88,14 +101,61 @@ class TradingEngine:
             return self.paper.nav()
         return self.oanda.nav()
 
-    def _update_drawdown(self, nav: float) -> tuple[float, float]:
-        current = float(self.storage.get_kv("nav_high_water", str(nav)) or nav)
-        high_water = max(current, nav)
-        self.storage.set_kv("nav_high_water", str(high_water))
-        drawdown = (
-            0.0 if high_water <= 0 else max(0.0, 1.0 - nav / high_water)
+    def _source_commit(self) -> str | None:
+        return resolve_source_commit(Path(__file__).resolve().parents[1])
+
+    def _evaluate_recovery(
+        self, nav: float, source_commit: str | None
+    ) -> dict[str, Any]:
+        return self.storage.evaluate_recovery(
+            nav=nav,
+            broker_mode=self.settings.broker_mode,
+            strategy_profile=self.settings.strategy_profile,
+            source_commit=source_commit,
+            observed_at=datetime.now(timezone.utc).isoformat(),
         )
-        return high_water, drawdown
+
+    def _update_drawdown(self, nav: float) -> tuple[float, float]:
+        return self.storage.update_nav_high_water_atomic(nav)
+
+    def _drawdown_readonly(self, nav: float) -> tuple[float | None, float | None]:
+        raw = self.storage.get_kv("nav_high_water")
+        if raw is None:
+            return None, None
+        try:
+            high_water = parse_positive_float_text(raw, name="nav_high_water")
+            return high_water, calculate_drawdown(nav, high_water)
+        except ValueError:
+            return None, None
+
+    @staticmethod
+    def _recovery_observability(recovery: dict[str, Any]) -> dict[str, Any]:
+        state = recovery.get("state") or {}
+        latest = recovery.get("latest_event") or {}
+        return {
+            "recovery_schema_version": state.get(
+                "schema_version", RECOVERY_SCHEMA_VERSION
+            ),
+            "recovery_state": state.get("state"),
+            "recovery_epoch": state.get("epoch"),
+            "recovery_latch_threshold": RECOVERY_LATCH_DRAWDOWN_STOP_V1,
+            "recovery_latched": state.get("state") != STATE_ACTIVE
+            if state
+            else False,
+            "recovery_integrity_ok": bool(recovery.get("integrity_ok")),
+            "recovery_entries_blocked": bool(recovery.get("entries_blocked")),
+            "recovery_block_reason": recovery.get("block_reason"),
+            "recovery_trip_id": state.get("trip_id"),
+            "recovery_trip_nav": state.get("trip_nav"),
+            "recovery_trip_high_water": state.get("trip_high_water"),
+            "recovery_trip_drawdown": state.get("trip_drawdown"),
+            "recovery_bootstrap_occurred": bool(
+                recovery.get("bootstrap_occurred")
+            ),
+            "recovery_latest_event_id": latest.get("id"),
+            "recovery_latest_event_time": latest.get("ts"),
+            "recovery_error": recovery.get("error"),
+        }
 
     def _monthly_metrics(self, nav: float) -> tuple[str, float, float]:
         month = datetime.now(timezone.utc).strftime("%Y-%m")
@@ -374,6 +434,21 @@ class TradingEngine:
             result["status"] = f"entry_blocked: {size.reason}"
             return result
 
+        final_recovery = self.storage.recovery_snapshot(
+            broker_mode=self.settings.broker_mode
+        )
+        if final_recovery.get("governed") and final_recovery.get(
+            "entries_blocked"
+        ):
+            result["status"] = (
+                "entry_blocked: "
+                + str(
+                    final_recovery.get("block_reason")
+                    or "recovery blocked"
+                )
+            )
+            return result
+
         fill = (
             self.paper.market_order(
                 instrument, side, size.units, stop_price
@@ -429,10 +504,25 @@ class TradingEngine:
         started = datetime.now(timezone.utc).isoformat()
         self.reconcile()
 
+        source_commit = self._source_commit()
         nav = self.nav()
-        high_water, drawdown = self._update_drawdown(nav)
+        recovery = self._evaluate_recovery(nav, source_commit)
+        recovery_bootstrap_occurred = bool(
+            recovery.get("bootstrap_occurred")
+        )
+        if recovery.get("governed"):
+            high_water = recovery.get("high_water")
+            drawdown = recovery.get("drawdown")
+            if high_water is None or drawdown is None:
+                high_water, drawdown = self._drawdown_readonly(nav)
+            if high_water is None:
+                high_water = nav
+            if drawdown is None:
+                drawdown = 0.0
+        else:
+            high_water, drawdown = self._update_drawdown(nav)
         month, month_start_nav, monthly_loss = self._monthly_metrics(nav)
-        entries_enabled, armed_reason = self._entries_enabled()
+        entries_enabled, armed_reason = self._entries_enabled(recovery)
 
         candles_by_instrument: dict[str, Any] = {}
         fetch_errors: dict[str, str] = {}
@@ -594,6 +684,25 @@ class TradingEngine:
                         "entry_skipped: lower_ranked_candidate"
                     )
 
+        nav = self.nav()
+        recovery = self._evaluate_recovery(nav, source_commit)
+        recovery_bootstrap_occurred = (
+            recovery_bootstrap_occurred
+            or bool(recovery.get("bootstrap_occurred"))
+        )
+        if recovery.get("governed"):
+            current_high_water = recovery.get("high_water")
+            current_drawdown = recovery.get("drawdown")
+            if current_high_water is None or current_drawdown is None:
+                current_high_water, current_drawdown = self._drawdown_readonly(nav)
+            if current_high_water is not None:
+                high_water = current_high_water
+            if current_drawdown is not None:
+                drawdown = current_drawdown
+        else:
+            high_water, drawdown = self._update_drawdown(nav)
+        entries_enabled, armed_reason = self._entries_enabled(recovery)
+
         for instrument, decision in selected:
             try:
                 results_by_instrument[instrument] = self._open_candidate(
@@ -620,6 +729,10 @@ class TradingEngine:
             results_by_instrument[instrument]
             for instrument in self.settings.instruments
         ]
+        recovery_observability = self._recovery_observability(recovery)
+        recovery_observability["recovery_bootstrap_occurred"] = (
+            recovery_bootstrap_occurred
+        )
         summary = {
             "started_at": started,
             "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -633,10 +746,18 @@ class TradingEngine:
             "month_start_nav": month_start_nav,
             "monthly_loss": monthly_loss,
             "circuit_breaker": (
-                drawdown >= self.settings.adaptive_drawdown_stop
-                if self.settings.adaptive_enabled
-                else drawdown >= self.settings.drawdown_stop
+                (
+                    bool(recovery.get("entries_blocked"))
+                    if recovery.get("governed")
+                    else False
+                )
+                or (
+                    drawdown >= self.settings.adaptive_drawdown_stop
+                    if self.settings.adaptive_enabled
+                    else drawdown >= self.settings.drawdown_stop
+                )
             ),
+            "recovery": recovery_observability,
             "currency_strength": strengths,
             "results": results,
         }
@@ -644,22 +765,36 @@ class TradingEngine:
         return summary
 
     def status(self) -> dict[str, Any]:
+        recovery = self.storage.recovery_snapshot(
+            broker_mode=self.settings.broker_mode
+        )
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+        month_start_nav = None
+        monthly_loss = None
+        raw_month_start = self.storage.get_kv(f"month_start_nav:{month}")
+        if raw_month_start is not None:
+            try:
+                parsed_month_start = float(raw_month_start)
+                if (
+                    parsed_month_start > 0.0
+                    and parsed_month_start == parsed_month_start
+                    and abs(parsed_month_start) != float("inf")
+                ):
+                    month_start_nav = parsed_month_start
+            except (TypeError, ValueError):
+                month_start_nav = None
+
         try:
             nav = self.nav()
-            high_water, drawdown = self._update_drawdown(nav)
-            month, month_start_nav, monthly_loss = (
-                self._monthly_metrics(nav)
-            )
+            high_water, drawdown = self._drawdown_readonly(nav)
+            if month_start_nav is not None:
+                monthly_return = nav / month_start_nav - 1.0
+                monthly_loss = max(0.0, -monthly_return)
             nav_error = None
         except Exception as exc:
             nav = None
-            high_water = float(
-                self.storage.get_kv("nav_high_water", "0") or 0
-            )
+            high_water = None
             drawdown = None
-            month = datetime.now(timezone.utc).strftime("%Y-%m")
-            month_start_nav = None
-            monthly_loss = None
             nav_error = str(exc)
 
         return {
@@ -682,6 +817,7 @@ class TradingEngine:
                 position.to_dict()
                 for position in self.storage.get_positions()
             ],
+            "recovery": self._recovery_observability(recovery),
             "risk": {
                 "per_trade": (
                     {
@@ -712,5 +848,6 @@ class TradingEngine:
                     if self.settings.adaptive_enabled
                     else self.settings.drawdown_stop
                 ),
+                "recovery_latch_drawdown": RECOVERY_LATCH_DRAWDOWN_STOP_V1,
             },
         }
