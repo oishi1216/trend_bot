@@ -488,6 +488,92 @@ def test_production_source_contract_fails_closed_on_unresolved_dynamic_mutator(
     )
 
 
+def test_production_source_contract_fails_closed_on_parameter_shadowing(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "shadowed_key.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def mutate(storage, KEY):\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "app/shadowed_key.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_ambiguous_local_shadowing(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "ambiguous_key.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def mutate(storage, source):\n'
+        '    KEY = "scheduled_run"\n'
+        '    KEY = source\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "app/ambiguous_key.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_rejects_class_body_high_water_writer(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "class_body_writer.py").write_text(
+        'class Rogue:\n'
+        '    storage.set_kv("nav_high_water", "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "scripts/class_body_writer.py"
+        and row["function"] == "<class:Rogue>"
+        and row["resolved_key"] == "nav_high_water"
+        for row in result["nav_high_water_writer_calls"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_class_body_dynamic_writer(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "class_body_dynamic.py").write_text(
+        'class Rogue:\n'
+        '    storage.set_kv(key, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "scripts/class_body_dynamic.py"
+        and row["function"] == "<class:Rogue>"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
 def test_production_source_contract_rejects_missing_adaptive_zeroing(
     tmp_path: Path,
 ) -> None:

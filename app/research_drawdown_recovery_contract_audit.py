@@ -409,6 +409,187 @@ def _unique_expression_bindings(node: ast.AST) -> dict[str, ast.AST]:
     }
 
 
+def _assignment_target_names(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names: set[str] = set()
+        for element in target.elts:
+            names.update(_assignment_target_names(element))
+        return names
+    if isinstance(target, ast.Starred):
+        return _assignment_target_names(target.value)
+    return set()
+
+
+def _scope_bound_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        args = node.args
+        names.update(arg.arg for arg in args.posonlyargs)
+        names.update(arg.arg for arg in args.args)
+        names.update(arg.arg for arg in args.kwonlyargs)
+        if args.vararg is not None:
+            names.add(args.vararg.arg)
+        if args.kwarg is not None:
+            names.add(args.kwarg.arg)
+
+    class BindingCollector(ast.NodeVisitor):
+        def visit_FunctionDef(self, child: ast.FunctionDef) -> None:
+            if child is node:
+                for statement in child.body:
+                    self.visit(statement)
+            else:
+                names.add(child.name)
+
+        def visit_AsyncFunctionDef(self, child: ast.AsyncFunctionDef) -> None:
+            if child is node:
+                for statement in child.body:
+                    self.visit(statement)
+            else:
+                names.add(child.name)
+
+        def visit_ClassDef(self, child: ast.ClassDef) -> None:
+            if child is node:
+                for statement in child.body:
+                    self.visit(statement)
+            else:
+                names.add(child.name)
+
+        def visit_Lambda(self, child: ast.Lambda) -> None:
+            return
+
+        def visit_Assign(self, child: ast.Assign) -> None:
+            for target in child.targets:
+                names.update(_assignment_target_names(target))
+            self.visit(child.value)
+
+        def visit_AnnAssign(self, child: ast.AnnAssign) -> None:
+            names.update(_assignment_target_names(child.target))
+            if child.value is not None:
+                self.visit(child.value)
+
+        def visit_AugAssign(self, child: ast.AugAssign) -> None:
+            names.update(_assignment_target_names(child.target))
+            self.visit(child.value)
+
+        def visit_For(self, child: ast.For) -> None:
+            names.update(_assignment_target_names(child.target))
+            self.visit(child.iter)
+            for statement in child.body:
+                self.visit(statement)
+            for statement in child.orelse:
+                self.visit(statement)
+
+        def visit_AsyncFor(self, child: ast.AsyncFor) -> None:
+            self.visit_For(child)
+
+        def visit_With(self, child: ast.With) -> None:
+            for item in child.items:
+                self.visit(item.context_expr)
+                if item.optional_vars is not None:
+                    names.update(_assignment_target_names(item.optional_vars))
+            for statement in child.body:
+                self.visit(statement)
+
+        def visit_AsyncWith(self, child: ast.AsyncWith) -> None:
+            self.visit_With(child)
+
+        def visit_ExceptHandler(self, child: ast.ExceptHandler) -> None:
+            if child.name:
+                names.add(child.name)
+            if child.type is not None:
+                self.visit(child.type)
+            for statement in child.body:
+                self.visit(statement)
+
+        def visit_NamedExpr(self, child: ast.NamedExpr) -> None:
+            names.update(_assignment_target_names(child.target))
+            self.visit(child.value)
+
+        def visit_Import(self, child: ast.Import) -> None:
+            for alias in child.names:
+                names.add(alias.asname or alias.name.split(".", 1)[0])
+
+        def visit_ImportFrom(self, child: ast.ImportFrom) -> None:
+            for alias in child.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
+
+        def visit_ListComp(self, child: ast.ListComp) -> None:
+            return
+
+        def visit_SetComp(self, child: ast.SetComp) -> None:
+            return
+
+        def visit_DictComp(self, child: ast.DictComp) -> None:
+            return
+
+        def visit_GeneratorExp(self, child: ast.GeneratorExp) -> None:
+            return
+
+    BindingCollector().visit(node)
+    return names
+
+
+def _imported_repository_bindings(
+    tree: ast.Module,
+    *,
+    repository_bindings: Mapping[str, ast.AST],
+) -> dict[str, ast.AST]:
+    imported: dict[str, ast.AST] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.ImportFrom):
+            continue
+        for alias in statement.names:
+            if alias.name == "*":
+                continue
+            expression = repository_bindings.get(alias.name)
+            if expression is None:
+                continue
+            imported[alias.asname or alias.name] = expression
+    return imported
+
+
+def _executable_calls(statements: Sequence[ast.stmt]) -> list[ast.Call]:
+    calls: list[ast.Call] = []
+
+    class ExecutableCallCollector(ast.NodeVisitor):
+        def visit_Call(self, node: ast.Call) -> None:
+            calls.append(node)
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            return
+
+        def visit_SetComp(self, node: ast.SetComp) -> None:
+            return
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            return
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+    collector = ExecutableCallCollector()
+    for statement in statements:
+        collector.visit(statement)
+    return calls
+
+
 def _helper_return_expressions(tree: ast.Module) -> dict[str, ast.AST]:
     candidates: dict[str, list[ast.AST]] = {}
     for function in (
@@ -662,6 +843,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
     unresolved_kv_mutators: list[dict[str, Any]] = []
     passthrough_mutators: list[dict[str, Any]] = []
     reset_named_functions: list[str] = []
+    processed_mutators: set[tuple[str, int, int, str]] = set()
 
     source_modules: list[
         tuple[Path, str, str, ast.Module, dict[str, ast.AST], dict[str, ast.AST]]
@@ -722,9 +904,12 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         key_index = _MUTATOR_KEY_INDEX.get(call_name)
         if key_index is None:
             return
+        line = int(getattr(call, "lineno", 0))
+        column = int(getattr(call, "col_offset", 0))
+        processed_mutators.add((relative, line, column, call_name))
         row = {
             "path": relative,
-            "line": int(getattr(call, "lineno", 0)),
+            "line": line,
             "function": function_name,
             "call": call_name,
         }
@@ -774,10 +959,19 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         module_bindings,
         helper_returns,
     ) in source_modules:
+        module_bound_names = _scope_bound_names(source_tree)
         combined_module_bindings = {
-            **repository_bindings,
-            **module_bindings,
+            name: expression
+            for name, expression in repository_bindings.items()
+            if name not in module_bound_names
         }
+        combined_module_bindings.update(
+            _imported_repository_bindings(
+                source_tree,
+                repository_bindings=repository_bindings,
+            )
+        )
+        combined_module_bindings.update(module_bindings)
 
         for function in (
             node
@@ -800,13 +994,14 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     f"{relative}:{function.lineno}:{function.name}"
                 )
 
+            function_bound_names = _scope_bound_names(function)
             function_bindings = {
-                **combined_module_bindings,
-                **_unique_expression_bindings(function),
+                name: expression
+                for name, expression in combined_module_bindings.items()
+                if name not in function_bound_names
             }
-            for call in (
-                node for node in ast.walk(function) if isinstance(node, ast.Call)
-            ):
+            function_bindings.update(_unique_expression_bindings(function))
+            for call in _executable_calls(function.body):
                 inspect_mutator(
                     call=call,
                     relative=relative,
@@ -815,22 +1010,67 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     helper_returns=helper_returns,
                 )
 
-        for statement in source_tree.body:
-            if isinstance(
-                statement,
-                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-            ):
-                continue
-            for call in (
-                node for node in ast.walk(statement) if isinstance(node, ast.Call)
-            ):
+        for class_node in (
+            node for node in ast.walk(source_tree) if isinstance(node, ast.ClassDef)
+        ):
+            class_bound_names = _scope_bound_names(class_node)
+            class_bindings = {
+                name: expression
+                for name, expression in combined_module_bindings.items()
+                if name not in class_bound_names
+            }
+            class_bindings.update(_unique_expression_bindings(class_node))
+            for call in _executable_calls(class_node.body):
                 inspect_mutator(
                     call=call,
                     relative=relative,
-                    function_name="<module>",
-                    bindings=combined_module_bindings,
+                    function_name=f"<class:{class_node.name}>",
+                    bindings=class_bindings,
                     helper_returns=helper_returns,
                 )
+
+        for call in _executable_calls(source_tree.body):
+            inspect_mutator(
+                call=call,
+                relative=relative,
+                function_name="<module>",
+                bindings=combined_module_bindings,
+                helper_returns=helper_returns,
+            )
+
+    for (
+        _source_path,
+        relative,
+        _source_text,
+        source_tree,
+        _module_bindings,
+        _helper_returns,
+    ) in source_modules:
+        for call in (
+            node for node in ast.walk(source_tree) if isinstance(node, ast.Call)
+        ):
+            call_name = _call_name(call)
+            if call_name not in _MUTATOR_KEY_INDEX:
+                continue
+            identity = (
+                relative,
+                int(getattr(call, "lineno", 0)),
+                int(getattr(call, "col_offset", 0)),
+                call_name,
+            )
+            if identity in processed_mutators:
+                continue
+            unresolved_kv_mutators.append(
+                {
+                    "path": relative,
+                    "line": identity[1],
+                    "function": "<unscanned-lexical-scope>",
+                    "call": call_name,
+                    "key_status": "unresolved",
+                    "resolved_key": None,
+                    "reason": "unscanned_lexical_scope",
+                }
+            )
 
     allowed_writer_functions = {
         ("app/storage.py", "update_nav_high_water_atomic", "_set_kv_conn"),
