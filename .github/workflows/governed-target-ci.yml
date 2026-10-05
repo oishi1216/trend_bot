@@ -1,0 +1,194 @@
+name: Governed Target CI
+
+on:
+  push:
+    branches:
+      - ci/27-governed-target-ci-v1
+    paths:
+      - ".github/workflows/governed-target-ci.yml"
+      - "ci/governed-target.json"
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: governed-target-ci-v1
+  cancel-in-progress: false
+
+jobs:
+  exact-sha-ci:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout CI control
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Load and validate target contract
+        shell: pwsh
+        run: |
+          $contractPath = Join-Path $env:GITHUB_WORKSPACE "control\ci\governed-target.json"
+          $contract = Get-Content -LiteralPath $contractPath -Raw | ConvertFrom-Json
+
+          if ($contract.schema_version -ne 1) {
+            throw "Unsupported contract schema_version"
+          }
+          if ($contract.repository -ne $env:GITHUB_REPOSITORY) {
+            throw "Repository identity mismatch"
+          }
+          if ([int]$contract.pr_number -le 0) {
+            throw "Invalid PR number"
+          }
+          if ($contract.target_sha -notmatch "^[0-9a-f]{40}$") {
+            throw "Invalid target SHA"
+          }
+          if ($contract.expected_base_sha -notmatch "^[0-9a-f]{40}$") {
+            throw "Invalid expected base SHA"
+          }
+          if ($contract.status_context -ne "governed-ci/trend-bot") {
+            throw "Unexpected status context"
+          }
+
+          "TARGET_SHA=$($contract.target_sha)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "EXPECTED_BASE_SHA=$($contract.expected_base_sha)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PR_NUMBER=$([int]$contract.pr_number)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "STATUS_CONTEXT=$($contract.status_context)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify frozen PR identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/pulls/$env:PR_NUMBER"
+          $pr = Invoke-RestMethod -Headers $headers -Uri $uri
+
+          if ($pr.state -ne "open") {
+            throw "Target PR is not open"
+          }
+          if (-not [bool]$pr.draft) {
+            throw "Target PR is no longer Draft"
+          }
+          if ($pr.head.repo.full_name -ne $env:GITHUB_REPOSITORY) {
+            throw "Target PR head repository mismatch"
+          }
+          if ($pr.head.sha -ne $env:TARGET_SHA) {
+            throw "Target PR head SHA drift"
+          }
+          if ($pr.base.sha -ne $env:EXPECTED_BASE_SHA) {
+            throw "Target PR base SHA drift"
+          }
+
+      - name: Publish pending exact-SHA status
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $body = @{
+            state = "pending"
+            context = $env:STATUS_CONTEXT
+            description = "Governed exact-SHA CI running"
+            target_url = $runUrl
+          } | ConvertTo-Json -Compress
+          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:TARGET_SHA"
+          Invoke-RestMethod -Method Post -Headers $headers -Uri $uri -Body $body -ContentType "application/json" | Out-Null
+
+      - name: Checkout exact target SHA
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ env.TARGET_SHA }}
+          path: target
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Verify exact checkout
+        shell: pwsh
+        run: |
+          $actual = (git -C target rev-parse HEAD).Trim()
+          if ($actual -ne $env:TARGET_SHA) {
+            throw "Checked out SHA does not match target contract"
+          }
+          Write-Output "TARGET_SHA=$actual"
+
+      - name: Set up Python 3.12.10
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12.10"
+
+      - name: Install dependencies
+        working-directory: target
+        shell: pwsh
+        run: |
+          python -m pip install -r requirements.txt
+          python --version
+          python -m pip freeze
+
+      - name: Compile R1 sources
+        working-directory: target
+        shell: pwsh
+        run: |
+          python -m py_compile app/recovery_authority.py app/storage.py app/engine.py tests/test_recovery_authority.py
+
+      - name: Focused R1 tests
+        working-directory: target
+        shell: pwsh
+        run: |
+          python -m pytest -q tests/test_recovery_authority.py
+
+      - name: Related regression tests
+        working-directory: target
+        shell: pwsh
+        run: |
+          python -m pytest -q tests/test_recovery_authority.py tests/test_adaptive_engine_risk.py tests/test_adaptive_config.py tests/test_adaptive_strategy.py tests/test_adaptive_dashboard.py tests/test_research_drawdown_recovery_contract_audit.py tests/test_research_candidate_day_divergence_audit.py
+
+      - name: Full test suite
+        working-directory: target
+        shell: pwsh
+        run: |
+          python -m pytest -q
+
+      - name: Publish final exact-SHA status
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $state = if ($env:JOB_STATUS -eq "success") { "success" } else { "failure" }
+          $description = if ($state -eq "success") {
+            "Governed exact-SHA CI passed"
+          } else {
+            "Governed exact-SHA CI failed"
+          }
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $body = @{
+            state = $state
+            context = $env:STATUS_CONTEXT
+            description = $description
+            target_url = $runUrl
+          } | ConvertTo-Json -Compress
+          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/statuses/$env:TARGET_SHA"
+          Invoke-RestMethod -Method Post -Headers $headers -Uri $uri -Body $body -ContentType "application/json" | Out-Null
