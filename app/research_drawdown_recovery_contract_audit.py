@@ -374,6 +374,35 @@ _EXCLUDED_SOURCE_PARTS = {
 _AUDIT_SOURCE_PATH = "app/research_drawdown_recovery_contract_audit.py"
 
 
+def _pattern_capture_names(pattern: ast.pattern) -> set[str]:
+    names: set[str] = set()
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.name is not None:
+            names.add(pattern.name)
+        if pattern.pattern is not None:
+            names.update(_pattern_capture_names(pattern.pattern))
+    elif isinstance(pattern, ast.MatchStar):
+        if pattern.name is not None:
+            names.add(pattern.name)
+    elif isinstance(pattern, ast.MatchMapping):
+        for child in pattern.patterns:
+            names.update(_pattern_capture_names(child))
+        if pattern.rest is not None:
+            names.add(pattern.rest)
+    elif isinstance(pattern, ast.MatchSequence):
+        for child in pattern.patterns:
+            names.update(_pattern_capture_names(child))
+    elif isinstance(pattern, ast.MatchClass):
+        for child in pattern.patterns:
+            names.update(_pattern_capture_names(child))
+        for child in pattern.kwd_patterns:
+            names.update(_pattern_capture_names(child))
+    elif isinstance(pattern, ast.MatchOr):
+        for child in pattern.patterns:
+            names.update(_pattern_capture_names(child))
+    return names
+
+
 def _scope_binding_facts(node: ast.AST) -> dict[str, Any]:
     counts: dict[str, int] = {}
     candidates: dict[str, list[ast.AST]] = {}
@@ -507,6 +536,20 @@ def _scope_binding_facts(node: ast.AST) -> dict[str, Any]:
             bind_target(child.target)
             self.visit(child.value)
 
+        def visit_Delete(self, child: ast.Delete) -> None:
+            for target in child.targets:
+                bind_target(target)
+
+        def visit_Match(self, child: ast.Match) -> None:
+            self.visit(child.subject)
+            for case in child.cases:
+                for name in _pattern_capture_names(case.pattern):
+                    bind(name)
+                if case.guard is not None:
+                    self.visit(case.guard)
+                for statement in case.body:
+                    self.visit(statement)
+
         def visit_Import(self, child: ast.Import) -> None:
             for alias in child.names:
                 bind(alias.asname or alias.name.split(".", 1)[0])
@@ -567,6 +610,7 @@ def _scope_binding_facts(node: ast.AST) -> dict[str, Any]:
     }
     return {
         "bound_names": set(counts),
+        "binding_counts": dict(counts),
         "unique_bindings": unique_bindings,
         "global_names": global_names,
         "nonlocal_names": nonlocal_names,
@@ -611,6 +655,45 @@ def _imported_repository_bindings(
                 continue
             imported[alias.asname or alias.name] = expression
     return imported
+
+
+def _global_declared_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Global):
+            names.update(node.names)
+    return names
+
+
+def _descendant_nonlocal_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for child in ast.walk(node):
+        if child is node:
+            continue
+        if isinstance(child, ast.Nonlocal):
+            names.update(child.names)
+    return names
+
+
+def _freeze_bindings(
+    bindings: Mapping[str, ast.AST],
+    *,
+    helper_returns: Mapping[str, ast.AST],
+) -> dict[str, ast.AST]:
+    frozen: dict[str, ast.AST] = {}
+    for name, expression in bindings.items():
+        status, value = _resolve_key_expression(
+            expression,
+            bindings=bindings,
+            helper_returns=helper_returns,
+        )
+        if status == "exact" and value is not None:
+            frozen[name] = ast.Constant(value=value)
+        elif status == "safe_non_target":
+            frozen[name] = ast.Constant(
+                value=f"__audit_safe_non_target__:{name}"
+            )
+    return frozen
 
 
 def _executable_calls(statements: Sequence[ast.stmt]) -> list[ast.Call]:
@@ -1057,6 +1140,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             source_tree,
             repository_bindings=repository_bindings,
         )
+        module_global_unstable_names = _global_declared_names(source_tree)
 
         def scan_scope(
             scope_node: ast.AST,
@@ -1065,15 +1149,34 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             scope_name: str,
         ) -> None:
             facts = _scope_binding_facts(scope_node)
+            descendant_nonlocal_names = (
+                _descendant_nonlocal_names(scope_node)
+                if isinstance(
+                    scope_node,
+                    (ast.FunctionDef, ast.AsyncFunctionDef),
+                )
+                else set()
+            )
+            blocked_names = (
+                set(facts["bound_names"])
+                | descendant_nonlocal_names
+            )
             scope_bindings = {
                 name: expression
                 for name, expression in inherited_bindings.items()
-                if name not in facts["bound_names"]
+                if name not in blocked_names
             }
 
             if isinstance(scope_node, ast.Module):
-                scope_bindings.update(imported_module_bindings)
-                scope_bindings.update(module_bindings)
+                for name, expression in imported_module_bindings.items():
+                    if (
+                        facts["binding_counts"].get(name) == 1
+                        and name not in module_global_unstable_names
+                    ):
+                        scope_bindings[name] = expression
+                for name, expression in module_bindings.items():
+                    if name not in module_global_unstable_names:
+                        scope_bindings[name] = expression
                 statements = scope_node.body
             elif isinstance(scope_node, ast.ClassDef):
                 # Class-body names use LOAD_NAME semantics rather than a
@@ -1081,8 +1184,15 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                 # assignment as proof for every executable statement.
                 statements = scope_node.body
             else:
-                scope_bindings.update(facts["unique_bindings"])
+                for name, expression in facts["unique_bindings"].items():
+                    if name not in descendant_nonlocal_names:
+                        scope_bindings[name] = expression
                 statements = scope_node.body
+
+            scope_bindings = _freeze_bindings(
+                scope_bindings,
+                helper_returns=helper_returns,
+            )
 
             if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 lower = scope_node.name.lower()

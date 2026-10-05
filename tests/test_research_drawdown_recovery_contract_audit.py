@@ -707,6 +707,128 @@ def test_production_source_contract_fails_closed_on_nonlocal_key_mutation(
     )
 
 
+def test_production_source_contract_fails_closed_on_global_setter_reader(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "global_setter_reader.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def set_key(source):\n'
+        '    global KEY\n'
+        '    KEY = source\n'
+        'def mutate(storage, source):\n'
+        '    set_key(source)\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/global_setter_reader.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_nonlocal_setter_sibling_reader(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "nonlocal_setter_reader.py").write_text(
+        'def outer(storage, source):\n'
+        '    KEY = "scheduled_run"\n'
+        '    def set_key():\n'
+        '        nonlocal KEY\n'
+        '        KEY = source\n'
+        '    def mutate():\n'
+        '        storage.set_kv(KEY, "0")\n'
+        '    set_key()\n'
+        '    mutate()\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/nonlocal_setter_reader.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_freezes_alias_in_defining_scope(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "captured_alias.py").write_text(
+        'def outer(storage):\n'
+        '    KEY = "nav_high_water"\n'
+        '    ALIAS = KEY\n'
+        '    def inner():\n'
+        '        KEY = "scheduled_run"\n'
+        '        storage.set_kv(ALIAS, "0")\n'
+        '    inner()\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/captured_alias.py"
+        and row["resolved_key"] == "nav_high_water"
+        for row in result["nav_high_water_writer_calls"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_import_alias_ambiguity(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "import_alias.py").write_text(
+        'from app.recovery_authority import RECOVERY_STATE_KEY as KEY\n'
+        'KEY = "nav_high_water"\n'
+        'def mutate(storage):\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/import_alias.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_match_pattern_capture(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "match_capture.py").write_text(
+        'def mutate(storage, source):\n'
+        '    KEY = "scheduled_run"\n'
+        '    match source:\n'
+        '        case {"key": KEY}:\n'
+        '            storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/match_capture.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
 def test_production_source_contract_rejects_missing_adaptive_zeroing(
     tmp_path: Path,
 ) -> None:
