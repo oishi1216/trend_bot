@@ -402,6 +402,7 @@ def test_production_source_contract_accepts_current_r1_repo() -> None:
     assert result["persistent_latch_transition"] is True
     assert result["persistent_latch_no_self_clear"] is True
     assert result["all_high_water_writers_governed"] is True
+    assert result["unresolved_kv_mutators"] == []
     assert result["no_future_recovery_mutation"] is True
     assert result["no_automatic_reset_path_found"] is True
 
@@ -424,6 +425,67 @@ def test_production_source_contract_rejects_rogue_high_water_writer(
     result = audit.audit_production_source_contract(repo)
     assert result["contract_ok"] is False
     assert result["all_high_water_writers_governed"] is False
+
+
+def test_production_source_contract_rejects_alias_high_water_writer(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "alias_writer.py").write_text(
+        'KEY = "nav_high_water"\n'
+        'def mutate(storage):\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "app/alias_writer.py"
+        and row["resolved_key"] == "nav_high_water"
+        for row in result["nav_high_water_writer_calls"]
+    )
+
+
+def test_production_source_contract_rejects_writer_outside_app(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "reset_high_water.py").write_text(
+        'def mutate(storage):\n'
+        '    storage.set_kv("nav_high_water", "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "scripts/reset_high_water.py"
+        for row in result["nav_high_water_writer_calls"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_unresolved_dynamic_mutator(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "dynamic_writer.py").write_text(
+        'def mutate(storage, key):\n'
+        '    storage.set_kv(key, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "scripts/dynamic_writer.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
 
 
 def test_production_source_contract_rejects_missing_adaptive_zeroing(

@@ -357,6 +357,170 @@ def _module_constant(tree: ast.Module, name: str) -> Any:
         return None
 
 
+_NAV_HIGH_WATER_KEY = "nav_high_water"
+_MUTATOR_KEY_INDEX = {
+    "set_kv": 0,
+    "delete_kv": 0,
+    "_set_kv_conn": 1,
+    "_delete_kv_conn": 1,
+}
+_EXCLUDED_SOURCE_PARTS = {
+    ".git",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+    "tests",
+}
+_AUDIT_SOURCE_PATH = "app/research_drawdown_recovery_contract_audit.py"
+
+
+def _unique_expression_bindings(node: ast.AST) -> dict[str, ast.AST]:
+    values: dict[str, list[ast.AST]] = {}
+
+    class BindingCollector(ast.NodeVisitor):
+        def visit_FunctionDef(self, child: ast.FunctionDef) -> None:
+            if child is node:
+                self.generic_visit(child)
+
+        def visit_AsyncFunctionDef(self, child: ast.AsyncFunctionDef) -> None:
+            if child is node:
+                self.generic_visit(child)
+
+        def visit_ClassDef(self, child: ast.ClassDef) -> None:
+            if child is node:
+                self.generic_visit(child)
+
+        def visit_Assign(self, child: ast.Assign) -> None:
+            for target in child.targets:
+                if isinstance(target, ast.Name):
+                    values.setdefault(target.id, []).append(child.value)
+            self.generic_visit(child.value)
+
+        def visit_AnnAssign(self, child: ast.AnnAssign) -> None:
+            if isinstance(child.target, ast.Name) and child.value is not None:
+                values.setdefault(child.target.id, []).append(child.value)
+                self.generic_visit(child.value)
+
+    BindingCollector().visit(node)
+    return {
+        name: expressions[0]
+        for name, expressions in values.items()
+        if len(expressions) == 1
+    }
+
+
+def _helper_return_expressions(tree: ast.Module) -> dict[str, ast.AST]:
+    candidates: dict[str, list[ast.AST]] = {}
+    for function in (
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ):
+        returns = [
+            child.value
+            for child in ast.walk(function)
+            if isinstance(child, ast.Return) and child.value is not None
+        ]
+        if len(returns) == 1:
+            candidates.setdefault(function.name, []).append(returns[0])
+    return {
+        name: expressions[0]
+        for name, expressions in candidates.items()
+        if len(expressions) == 1
+    }
+
+
+def _resolve_key_expression(
+    expression: ast.AST,
+    *,
+    bindings: Mapping[str, ast.AST],
+    helper_returns: Mapping[str, ast.AST],
+    seen_names: frozenset[str] = frozenset(),
+) -> tuple[str, str | None]:
+    if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+        return "exact", expression.value
+
+    if isinstance(expression, ast.Name):
+        if expression.id in seen_names:
+            return "unresolved", None
+        bound = bindings.get(expression.id)
+        if bound is None:
+            return "unresolved", None
+        return _resolve_key_expression(
+            bound,
+            bindings=bindings,
+            helper_returns=helper_returns,
+            seen_names=seen_names | {expression.id},
+        )
+
+    if isinstance(expression, ast.JoinedStr):
+        prefix = ""
+        suffix = ""
+        before_dynamic = True
+        after_dynamic_parts: list[str] = []
+        has_dynamic = False
+        for value in expression.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                if before_dynamic:
+                    prefix += value.value
+                else:
+                    after_dynamic_parts.append(value.value)
+            else:
+                before_dynamic = False
+                has_dynamic = True
+                after_dynamic_parts = []
+        suffix = "".join(after_dynamic_parts)
+        if not has_dynamic:
+            return "exact", prefix
+        if prefix and not _NAV_HIGH_WATER_KEY.startswith(prefix):
+            return "safe_non_target", prefix
+        if suffix and not _NAV_HIGH_WATER_KEY.endswith(suffix):
+            return "safe_non_target", suffix
+        return "unresolved", None
+
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+        left_status, left_value = _resolve_key_expression(
+            expression.left,
+            bindings=bindings,
+            helper_returns=helper_returns,
+            seen_names=seen_names,
+        )
+        right_status, right_value = _resolve_key_expression(
+            expression.right,
+            bindings=bindings,
+            helper_returns=helper_returns,
+            seen_names=seen_names,
+        )
+        if left_status == right_status == "exact":
+            return "exact", f"{left_value}{right_value}"
+        if left_status == "exact" and left_value and not _NAV_HIGH_WATER_KEY.startswith(left_value):
+            return "safe_non_target", left_value
+        if right_status == "exact" and right_value and not _NAV_HIGH_WATER_KEY.endswith(right_value):
+            return "safe_non_target", right_value
+        if left_status == "safe_non_target" or right_status == "safe_non_target":
+            return "safe_non_target", None
+        return "unresolved", None
+
+    if isinstance(expression, ast.Call):
+        helper = helper_returns.get(_call_name(expression))
+        if helper is not None:
+            return _resolve_key_expression(
+                helper,
+                bindings=bindings,
+                helper_returns=helper_returns,
+                seen_names=seen_names,
+            )
+
+    return "unresolved", None
+
+
+def _source_file_is_in_scope(root: Path, path: Path) -> bool:
+    relative = path.relative_to(root)
+    if relative.as_posix() == _AUDIT_SOURCE_PATH:
+        return False
+    return not any(part in _EXCLUDED_SOURCE_PARTS for part in relative.parts)
+
+
 def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
     root = Path(repo_root)
     paths = {
@@ -495,58 +659,191 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
 
     nav_high_water_calls: list[dict[str, Any]] = []
     writer_calls: list[dict[str, Any]] = []
+    unresolved_kv_mutators: list[dict[str, Any]] = []
+    passthrough_mutators: list[dict[str, Any]] = []
     reset_named_functions: list[str] = []
-    mutation_call_names = {"set_kv", "_set_kv_conn", "delete_kv", "_delete_kv_conn"}
 
-    for path in sorted((root / "app").rglob("*.py")):
-        if any(part in {".git", ".venv", "__pycache__"} for part in path.parts):
+    source_modules: list[
+        tuple[Path, str, str, ast.Module, dict[str, ast.AST], dict[str, ast.AST]]
+    ] = []
+    repository_constant_candidates: dict[str, set[str]] = {}
+
+    for source_path in sorted(root.rglob("*.py")):
+        if not _source_file_is_in_scope(root, source_path):
             continue
-        text = path.read_text(encoding="utf-8")
+        source_text = source_path.read_text(encoding="utf-8")
         try:
-            tree = ast.parse(text)
+            source_tree = ast.parse(source_text)
         except SyntaxError as exc:
             raise RuntimeError(
-                f"cannot parse source during contract audit: {path}: {exc}"
+                f"cannot parse source during contract audit: {source_path}: {exc}"
             ) from exc
-        relative = path.relative_to(root).as_posix()
+        relative = source_path.relative_to(root).as_posix()
+        module_bindings = _unique_expression_bindings(source_tree)
+        helper_returns = _helper_return_expressions(source_tree)
+        source_modules.append(
+            (
+                source_path,
+                relative,
+                source_text,
+                source_tree,
+                module_bindings,
+                helper_returns,
+            )
+        )
+        for name, expression in module_bindings.items():
+            status, value = _resolve_key_expression(
+                expression,
+                bindings=module_bindings,
+                helper_returns=helper_returns,
+            )
+            if status == "exact" and value is not None:
+                repository_constant_candidates.setdefault(name, set()).add(value)
+
+    repository_bindings = {
+        name: ast.Constant(value=next(iter(values)))
+        for name, values in repository_constant_candidates.items()
+        if len(values) == 1
+    }
+
+    allowed_passthrough = {
+        ("app/storage.py", "set_kv", "_set_kv_conn", "key"),
+    }
+
+    def inspect_mutator(
+        *,
+        call: ast.Call,
+        relative: str,
+        function_name: str,
+        bindings: Mapping[str, ast.AST],
+        helper_returns: Mapping[str, ast.AST],
+    ) -> None:
+        call_name = _call_name(call)
+        key_index = _MUTATOR_KEY_INDEX.get(call_name)
+        if key_index is None:
+            return
+        row = {
+            "path": relative,
+            "line": int(getattr(call, "lineno", 0)),
+            "function": function_name,
+            "call": call_name,
+        }
+        if len(call.args) <= key_index:
+            unresolved_kv_mutators.append({**row, "reason": "missing_key_argument"})
+            return
+
+        key_expression = call.args[key_index]
+        status, resolved_key = _resolve_key_expression(
+            key_expression,
+            bindings=bindings,
+            helper_returns=helper_returns,
+        )
+        row["key_status"] = status
+        row["resolved_key"] = resolved_key
+
+        if status == "exact" and resolved_key == _NAV_HIGH_WATER_KEY:
+            nav_high_water_calls.append(row)
+            writer_calls.append(row)
+            return
+        if status in {"exact", "safe_non_target"}:
+            return
+
+        passthrough_key = (
+            key_expression.id
+            if isinstance(key_expression, ast.Name)
+            else ""
+        )
+        passthrough_identity = (
+            relative,
+            function_name,
+            call_name,
+            passthrough_key,
+        )
+        if passthrough_identity in allowed_passthrough:
+            passthrough_mutators.append(row)
+            return
+        unresolved_kv_mutators.append(
+            {**row, "reason": "unresolved_key_expression"}
+        )
+
+    for (
+        source_path,
+        relative,
+        source_text,
+        source_tree,
+        module_bindings,
+        helper_returns,
+    ) in source_modules:
+        combined_module_bindings = {
+            **repository_bindings,
+            **module_bindings,
+        }
 
         for function in (
-            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+            node
+            for node in ast.walk(source_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         ):
             lower = function.name.lower()
-            segment = ast.get_source_segment(text, function) or ""
+            segment = ast.get_source_segment(source_text, function) or ""
             if (
-                any(token in lower for token in ("reset", "rebaseline", "rearm", "probation"))
+                any(
+                    token in lower
+                    for token in ("reset", "rebaseline", "rearm", "probation")
+                )
                 and (
-                    "nav_high_water" in segment
+                    _NAV_HIGH_WATER_KEY in segment
                     or "RECOVERY_STATE_KEY" in segment
                 )
             ):
                 reset_named_functions.append(
                     f"{relative}:{function.lineno}:{function.name}"
                 )
-            for call in ast.walk(function):
-                if not isinstance(call, ast.Call) or not _call_has_string_arg(
-                    call, "nav_high_water"
-                ):
-                    continue
-                row = {
-                    "path": relative,
-                    "line": int(getattr(call, "lineno", 0)),
-                    "function": function.name,
-                    "call": _call_name(call),
-                }
-                nav_high_water_calls.append(row)
-                if row["call"] in mutation_call_names:
-                    writer_calls.append(row)
+
+            function_bindings = {
+                **combined_module_bindings,
+                **_unique_expression_bindings(function),
+            }
+            for call in (
+                node for node in ast.walk(function) if isinstance(node, ast.Call)
+            ):
+                inspect_mutator(
+                    call=call,
+                    relative=relative,
+                    function_name=function.name,
+                    bindings=function_bindings,
+                    helper_returns=helper_returns,
+                )
+
+        for statement in source_tree.body:
+            if isinstance(
+                statement,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
+            ):
+                continue
+            for call in (
+                node for node in ast.walk(statement) if isinstance(node, ast.Call)
+            ):
+                inspect_mutator(
+                    call=call,
+                    relative=relative,
+                    function_name="<module>",
+                    bindings=combined_module_bindings,
+                    helper_returns=helper_returns,
+                )
 
     allowed_writer_functions = {
         ("app/storage.py", "update_nav_high_water_atomic", "_set_kv_conn"),
         ("app/storage.py", "_evaluate_recovery_locked", "_set_kv_conn"),
     }
-    all_high_water_writers_governed = bool(writer_calls) and all(
-        (row["path"], row["function"], row["call"]) in allowed_writer_functions
-        for row in writer_calls
+    all_high_water_writers_governed = (
+        bool(writer_calls)
+        and not unresolved_kv_mutators
+        and all(
+            (row["path"], row["function"], row["call"])
+            in allowed_writer_functions
+            for row in writer_calls
+        )
     )
 
     future_transition_event_names = (
@@ -623,6 +920,8 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         "all_high_water_writers_governed": all_high_water_writers_governed,
         "nav_high_water_calls": nav_high_water_calls,
         "nav_high_water_writer_calls": writer_calls,
+        "unresolved_kv_mutators": unresolved_kv_mutators,
+        "passthrough_kv_mutators": passthrough_mutators,
         "single_expected_writer": all_high_water_writers_governed,
         "reset_named_functions_touching_nav_high_water": reset_named_functions,
         "no_future_recovery_mutation": no_future_recovery_mutation,
