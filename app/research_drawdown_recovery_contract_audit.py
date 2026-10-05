@@ -374,39 +374,207 @@ _EXCLUDED_SOURCE_PARTS = {
 _AUDIT_SOURCE_PATH = "app/research_drawdown_recovery_contract_audit.py"
 
 
-def _unique_expression_bindings(node: ast.AST) -> dict[str, ast.AST]:
-    values: dict[str, list[ast.AST]] = {}
+def _scope_binding_facts(node: ast.AST) -> dict[str, Any]:
+    counts: dict[str, int] = {}
+    candidates: dict[str, list[ast.AST]] = {}
+    global_names: set[str] = set()
+    nonlocal_names: set[str] = set()
+
+    def bind(name: str, expression: ast.AST | None = None) -> None:
+        counts[name] = counts.get(name, 0) + 1
+        if expression is not None:
+            candidates.setdefault(name, []).append(expression)
+
+    def bind_target(
+        target: ast.AST,
+        *,
+        expression: ast.AST | None = None,
+    ) -> None:
+        names = _assignment_target_names(target)
+        if isinstance(target, ast.Name) and expression is not None:
+            bind(target.id, expression)
+            return
+        for name in names:
+            bind(name)
+
+    def visit_function_definition_expressions(
+        collector: ast.NodeVisitor,
+        child: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+    ) -> None:
+        args = child.args
+        for value in args.defaults:
+            collector.visit(value)
+        for value in args.kw_defaults:
+            if value is not None:
+                collector.visit(value)
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for decorator in child.decorator_list:
+                collector.visit(decorator)
+            if child.returns is not None:
+                collector.visit(child.returns)
+
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        args = node.args
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            bind(arg.arg)
+        if args.vararg is not None:
+            bind(args.vararg.arg)
+        if args.kwarg is not None:
+            bind(args.kwarg.arg)
 
     class BindingCollector(ast.NodeVisitor):
+        def visit_Module(self, child: ast.Module) -> None:
+            for statement in child.body:
+                self.visit(statement)
+
         def visit_FunctionDef(self, child: ast.FunctionDef) -> None:
             if child is node:
-                self.generic_visit(child)
+                for statement in child.body:
+                    self.visit(statement)
+                return
+            bind(child.name)
+            visit_function_definition_expressions(self, child)
 
         def visit_AsyncFunctionDef(self, child: ast.AsyncFunctionDef) -> None:
             if child is node:
-                self.generic_visit(child)
+                for statement in child.body:
+                    self.visit(statement)
+                return
+            bind(child.name)
+            visit_function_definition_expressions(self, child)
 
         def visit_ClassDef(self, child: ast.ClassDef) -> None:
             if child is node:
-                self.generic_visit(child)
+                for statement in child.body:
+                    self.visit(statement)
+                return
+            bind(child.name)
+            for decorator in child.decorator_list:
+                self.visit(decorator)
+            for base in child.bases:
+                self.visit(base)
+            for keyword in child.keywords:
+                self.visit(keyword.value)
+
+        def visit_Lambda(self, child: ast.Lambda) -> None:
+            visit_function_definition_expressions(self, child)
 
         def visit_Assign(self, child: ast.Assign) -> None:
             for target in child.targets:
-                if isinstance(target, ast.Name):
-                    values.setdefault(target.id, []).append(child.value)
-            self.generic_visit(child.value)
+                bind_target(target, expression=child.value)
+            self.visit(child.value)
 
         def visit_AnnAssign(self, child: ast.AnnAssign) -> None:
-            if isinstance(child.target, ast.Name) and child.value is not None:
-                values.setdefault(child.target.id, []).append(child.value)
-                self.generic_visit(child.value)
+            bind_target(child.target, expression=child.value)
+            if child.value is not None:
+                self.visit(child.value)
+
+        def visit_AugAssign(self, child: ast.AugAssign) -> None:
+            bind_target(child.target)
+            self.visit(child.value)
+
+        def visit_For(self, child: ast.For) -> None:
+            bind_target(child.target)
+            self.visit(child.iter)
+            for statement in child.body:
+                self.visit(statement)
+            for statement in child.orelse:
+                self.visit(statement)
+
+        def visit_AsyncFor(self, child: ast.AsyncFor) -> None:
+            self.visit_For(child)
+
+        def visit_With(self, child: ast.With) -> None:
+            for item in child.items:
+                self.visit(item.context_expr)
+                if item.optional_vars is not None:
+                    bind_target(item.optional_vars)
+            for statement in child.body:
+                self.visit(statement)
+
+        def visit_AsyncWith(self, child: ast.AsyncWith) -> None:
+            self.visit_With(child)
+
+        def visit_ExceptHandler(self, child: ast.ExceptHandler) -> None:
+            if child.name:
+                bind(child.name)
+            if child.type is not None:
+                self.visit(child.type)
+            for statement in child.body:
+                self.visit(statement)
+
+        def visit_NamedExpr(self, child: ast.NamedExpr) -> None:
+            bind_target(child.target)
+            self.visit(child.value)
+
+        def visit_Import(self, child: ast.Import) -> None:
+            for alias in child.names:
+                bind(alias.asname or alias.name.split(".", 1)[0])
+
+        def visit_ImportFrom(self, child: ast.ImportFrom) -> None:
+            for alias in child.names:
+                if alias.name != "*":
+                    bind(alias.asname or alias.name)
+
+        def visit_Global(self, child: ast.Global) -> None:
+            for name in child.names:
+                global_names.add(name)
+                bind(name)
+
+        def visit_Nonlocal(self, child: ast.Nonlocal) -> None:
+            for name in child.names:
+                nonlocal_names.add(name)
+                bind(name)
+
+        def _visit_comprehension(
+            self,
+            generators: list[ast.comprehension],
+            values: list[ast.AST],
+        ) -> None:
+            # Comprehension iteration variables live in the comprehension's
+            # implicit scope. Named expressions inside the expressions bind
+            # to the containing scope, so visit expressions but not targets.
+            for generator in generators:
+                self.visit(generator.iter)
+                for condition in generator.ifs:
+                    self.visit(condition)
+            for value in values:
+                self.visit(value)
+
+        def visit_ListComp(self, child: ast.ListComp) -> None:
+            self._visit_comprehension(child.generators, [child.elt])
+
+        def visit_SetComp(self, child: ast.SetComp) -> None:
+            self._visit_comprehension(child.generators, [child.elt])
+
+        def visit_DictComp(self, child: ast.DictComp) -> None:
+            self._visit_comprehension(
+                child.generators,
+                [child.key, child.value],
+            )
+
+        def visit_GeneratorExp(self, child: ast.GeneratorExp) -> None:
+            self._visit_comprehension(child.generators, [child.elt])
 
     BindingCollector().visit(node)
-    return {
+    unique_bindings = {
         name: expressions[0]
-        for name, expressions in values.items()
-        if len(expressions) == 1
+        for name, expressions in candidates.items()
+        if counts.get(name) == 1
+        and len(expressions) == 1
+        and name not in global_names
+        and name not in nonlocal_names
     }
+    return {
+        "bound_names": set(counts),
+        "unique_bindings": unique_bindings,
+        "global_names": global_names,
+        "nonlocal_names": nonlocal_names,
+    }
+
+
+def _unique_expression_bindings(node: ast.AST) -> dict[str, ast.AST]:
+    return dict(_scope_binding_facts(node)["unique_bindings"])
 
 
 def _assignment_target_names(target: ast.AST) -> set[str]:
@@ -423,114 +591,7 @@ def _assignment_target_names(target: ast.AST) -> set[str]:
 
 
 def _scope_bound_names(node: ast.AST) -> set[str]:
-    names: set[str] = set()
-
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        args = node.args
-        names.update(arg.arg for arg in args.posonlyargs)
-        names.update(arg.arg for arg in args.args)
-        names.update(arg.arg for arg in args.kwonlyargs)
-        if args.vararg is not None:
-            names.add(args.vararg.arg)
-        if args.kwarg is not None:
-            names.add(args.kwarg.arg)
-
-    class BindingCollector(ast.NodeVisitor):
-        def visit_FunctionDef(self, child: ast.FunctionDef) -> None:
-            if child is node:
-                for statement in child.body:
-                    self.visit(statement)
-            else:
-                names.add(child.name)
-
-        def visit_AsyncFunctionDef(self, child: ast.AsyncFunctionDef) -> None:
-            if child is node:
-                for statement in child.body:
-                    self.visit(statement)
-            else:
-                names.add(child.name)
-
-        def visit_ClassDef(self, child: ast.ClassDef) -> None:
-            if child is node:
-                for statement in child.body:
-                    self.visit(statement)
-            else:
-                names.add(child.name)
-
-        def visit_Lambda(self, child: ast.Lambda) -> None:
-            return
-
-        def visit_Assign(self, child: ast.Assign) -> None:
-            for target in child.targets:
-                names.update(_assignment_target_names(target))
-            self.visit(child.value)
-
-        def visit_AnnAssign(self, child: ast.AnnAssign) -> None:
-            names.update(_assignment_target_names(child.target))
-            if child.value is not None:
-                self.visit(child.value)
-
-        def visit_AugAssign(self, child: ast.AugAssign) -> None:
-            names.update(_assignment_target_names(child.target))
-            self.visit(child.value)
-
-        def visit_For(self, child: ast.For) -> None:
-            names.update(_assignment_target_names(child.target))
-            self.visit(child.iter)
-            for statement in child.body:
-                self.visit(statement)
-            for statement in child.orelse:
-                self.visit(statement)
-
-        def visit_AsyncFor(self, child: ast.AsyncFor) -> None:
-            self.visit_For(child)
-
-        def visit_With(self, child: ast.With) -> None:
-            for item in child.items:
-                self.visit(item.context_expr)
-                if item.optional_vars is not None:
-                    names.update(_assignment_target_names(item.optional_vars))
-            for statement in child.body:
-                self.visit(statement)
-
-        def visit_AsyncWith(self, child: ast.AsyncWith) -> None:
-            self.visit_With(child)
-
-        def visit_ExceptHandler(self, child: ast.ExceptHandler) -> None:
-            if child.name:
-                names.add(child.name)
-            if child.type is not None:
-                self.visit(child.type)
-            for statement in child.body:
-                self.visit(statement)
-
-        def visit_NamedExpr(self, child: ast.NamedExpr) -> None:
-            names.update(_assignment_target_names(child.target))
-            self.visit(child.value)
-
-        def visit_Import(self, child: ast.Import) -> None:
-            for alias in child.names:
-                names.add(alias.asname or alias.name.split(".", 1)[0])
-
-        def visit_ImportFrom(self, child: ast.ImportFrom) -> None:
-            for alias in child.names:
-                if alias.name != "*":
-                    names.add(alias.asname or alias.name)
-
-        def visit_ListComp(self, child: ast.ListComp) -> None:
-            return
-
-        def visit_SetComp(self, child: ast.SetComp) -> None:
-            return
-
-        def visit_DictComp(self, child: ast.DictComp) -> None:
-            return
-
-        def visit_GeneratorExp(self, child: ast.GeneratorExp) -> None:
-            return
-
-    BindingCollector().visit(node)
-    return names
+    return set(_scope_binding_facts(node)["bound_names"])
 
 
 def _imported_repository_bindings(
@@ -588,6 +649,39 @@ def _executable_calls(statements: Sequence[ast.stmt]) -> list[ast.Call]:
     for statement in statements:
         collector.visit(statement)
     return calls
+
+def _nested_scope_nodes(statements: Sequence[ast.stmt]) -> list[ast.AST]:
+    scopes: list[ast.AST] = []
+
+    class NestedScopeCollector(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            scopes.append(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            scopes.append(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            scopes.append(node)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_ListComp(self, node: ast.ListComp) -> None:
+            return
+
+        def visit_SetComp(self, node: ast.SetComp) -> None:
+            return
+
+        def visit_DictComp(self, node: ast.DictComp) -> None:
+            return
+
+        def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+            return
+
+    collector = NestedScopeCollector()
+    for statement in statements:
+        collector.visit(statement)
+    return scopes
 
 
 def _helper_return_expressions(tree: ast.Module) -> dict[str, ast.AST]:
@@ -959,84 +1053,87 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         module_bindings,
         helper_returns,
     ) in source_modules:
-        module_bound_names = _scope_bound_names(source_tree)
-        combined_module_bindings = {
-            name: expression
-            for name, expression in repository_bindings.items()
-            if name not in module_bound_names
-        }
-        combined_module_bindings.update(
-            _imported_repository_bindings(
-                source_tree,
-                repository_bindings=repository_bindings,
-            )
+        imported_module_bindings = _imported_repository_bindings(
+            source_tree,
+            repository_bindings=repository_bindings,
         )
-        combined_module_bindings.update(module_bindings)
 
-        for function in (
-            node
-            for node in ast.walk(source_tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ):
-            lower = function.name.lower()
-            segment = ast.get_source_segment(source_text, function) or ""
-            if (
-                any(
-                    token in lower
-                    for token in ("reset", "rebaseline", "rearm", "probation")
-                )
-                and (
-                    _NAV_HIGH_WATER_KEY in segment
-                    or "RECOVERY_STATE_KEY" in segment
-                )
-            ):
-                reset_named_functions.append(
-                    f"{relative}:{function.lineno}:{function.name}"
-                )
-
-            function_bound_names = _scope_bound_names(function)
-            function_bindings = {
+        def scan_scope(
+            scope_node: ast.AST,
+            *,
+            inherited_bindings: Mapping[str, ast.AST],
+            scope_name: str,
+        ) -> None:
+            facts = _scope_binding_facts(scope_node)
+            scope_bindings = {
                 name: expression
-                for name, expression in combined_module_bindings.items()
-                if name not in function_bound_names
+                for name, expression in inherited_bindings.items()
+                if name not in facts["bound_names"]
             }
-            function_bindings.update(_unique_expression_bindings(function))
-            for call in _executable_calls(function.body):
+
+            if isinstance(scope_node, ast.Module):
+                scope_bindings.update(imported_module_bindings)
+                scope_bindings.update(module_bindings)
+                statements = scope_node.body
+            elif isinstance(scope_node, ast.ClassDef):
+                # Class-body names use LOAD_NAME semantics rather than a
+                # lexical closure. Do not retroactively treat a class-local
+                # assignment as proof for every executable statement.
+                statements = scope_node.body
+            else:
+                scope_bindings.update(facts["unique_bindings"])
+                statements = scope_node.body
+
+            if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                lower = scope_node.name.lower()
+                segment = ast.get_source_segment(source_text, scope_node) or ""
+                if (
+                    any(
+                        token in lower
+                        for token in ("reset", "rebaseline", "rearm", "probation")
+                    )
+                    and (
+                        _NAV_HIGH_WATER_KEY in segment
+                        or "RECOVERY_STATE_KEY" in segment
+                    )
+                ):
+                    reset_named_functions.append(
+                        f"{relative}:{scope_node.lineno}:{scope_node.name}"
+                    )
+
+            for call in _executable_calls(statements):
                 inspect_mutator(
                     call=call,
                     relative=relative,
-                    function_name=function.name,
-                    bindings=function_bindings,
+                    function_name=scope_name,
+                    bindings=scope_bindings,
                     helper_returns=helper_returns,
                 )
 
-        for class_node in (
-            node for node in ast.walk(source_tree) if isinstance(node, ast.ClassDef)
-        ):
-            class_bound_names = _scope_bound_names(class_node)
-            class_bindings = {
-                name: expression
-                for name, expression in combined_module_bindings.items()
-                if name not in class_bound_names
-            }
-            class_bindings.update(_unique_expression_bindings(class_node))
-            for call in _executable_calls(class_node.body):
-                inspect_mutator(
-                    call=call,
-                    relative=relative,
-                    function_name=f"<class:{class_node.name}>",
-                    bindings=class_bindings,
-                    helper_returns=helper_returns,
+            for child_scope in _nested_scope_nodes(statements):
+                if isinstance(scope_node, ast.ClassDef):
+                    # Function/class bodies nested in a class do not close
+                    # over the class namespace. They may still close over the
+                    # lexical scope that contains the class itself.
+                    child_inherited = inherited_bindings
+                else:
+                    child_inherited = scope_bindings
+
+                if isinstance(child_scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    child_name = child_scope.name
+                else:
+                    child_name = f"<class:{child_scope.name}>"
+                scan_scope(
+                    child_scope,
+                    inherited_bindings=child_inherited,
+                    scope_name=child_name,
                 )
 
-        for call in _executable_calls(source_tree.body):
-            inspect_mutator(
-                call=call,
-                relative=relative,
-                function_name="<module>",
-                bindings=combined_module_bindings,
-                helper_returns=helper_returns,
-            )
+        scan_scope(
+            source_tree,
+            inherited_bindings=repository_bindings,
+            scope_name="<module>",
+        )
 
     for (
         _source_path,

@@ -574,6 +574,139 @@ def test_production_source_contract_fails_closed_on_class_body_dynamic_writer(
     )
 
 
+def test_production_source_contract_rejects_nested_function_capture(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "nested_function_writer.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def outer(storage):\n'
+        '    KEY = "nav_high_water"\n'
+        '    def inner():\n'
+        '        storage.set_kv(KEY, "0")\n'
+        '    inner()\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "scripts/nested_function_writer.py"
+        and row["function"] == "inner"
+        and row["resolved_key"] == "nav_high_water"
+        for row in result["nav_high_water_writer_calls"]
+    )
+
+
+def test_production_source_contract_rejects_nested_class_capture(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "nested_class_writer.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def outer(storage):\n'
+        '    KEY = "nav_high_water"\n'
+        '    class Rogue:\n'
+        '        storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "scripts/nested_class_writer.py"
+        and row["function"] == "<class:Rogue>"
+        and row["resolved_key"] == "nav_high_water"
+        for row in result["nav_high_water_writer_calls"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_mixed_loop_binding(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "mixed_loop_writer.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def mutate(storage, source):\n'
+        '    KEY = "scheduled_run"\n'
+        '    for KEY in source:\n'
+        '        storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "scripts/mixed_loop_writer.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_global_key_mutation(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "global_writer.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def set_key(source):\n'
+        '    global KEY\n'
+        '    KEY = source\n'
+        'def mutate(storage):\n'
+        '    global KEY\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "scripts/global_writer.py"
+        and row["function"] == "mutate"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_nonlocal_key_mutation(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "nonlocal_writer.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def outer(storage, source):\n'
+        '    KEY = "scheduled_run"\n'
+        '    def set_key():\n'
+        '        nonlocal KEY\n'
+        '        KEY = source\n'
+        '    def mutate():\n'
+        '        nonlocal KEY\n'
+        '        storage.set_kv(KEY, "0")\n'
+        '    set_key()\n'
+        '    mutate()\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["all_high_water_writers_governed"] is False
+    assert any(
+        row["path"] == "scripts/nonlocal_writer.py"
+        and row["function"] == "mutate"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
 def test_production_source_contract_rejects_missing_adaptive_zeroing(
     tmp_path: Path,
 ) -> None:
