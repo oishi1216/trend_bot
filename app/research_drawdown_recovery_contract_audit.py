@@ -307,134 +307,325 @@ def _call_name(call: ast.Call) -> str:
     return ""
 
 
+def _normalized_node_source(text: str, node: ast.AST) -> str:
+    return " ".join((ast.get_source_segment(text, node) or "").split())
+
+
+def _call_has_string_arg(call: ast.Call, value: str) -> bool:
+    return any(
+        isinstance(arg, ast.Constant) and arg.value == value
+        for arg in call.args
+    )
+
+
+def _calls_with_key(
+    node: ast.AST,
+    *,
+    call_names: set[str],
+    key: str,
+) -> list[ast.Call]:
+    return [
+        call
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and _call_name(call) in call_names
+        and _call_has_string_arg(call, key)
+    ]
+
+
+def _module_constant(tree: ast.Module, name: str) -> Any:
+    values: list[ast.AST] = []
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            if any(
+                isinstance(target, ast.Name) and target.id == name
+                for target in statement.targets
+            ):
+                values.append(statement.value)
+        elif (
+            isinstance(statement, ast.AnnAssign)
+            and isinstance(statement.target, ast.Name)
+            and statement.target.id == name
+            and statement.value is not None
+        ):
+            values.append(statement.value)
+    if len(values) != 1:
+        return None
+    try:
+        return ast.literal_eval(values[0])
+    except (ValueError, TypeError):
+        return None
+
+
 def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
     root = Path(repo_root)
-    engine_path = root / "app" / "engine.py"
-    if not engine_path.is_file():
-        raise RuntimeError(f"engine source not found: {engine_path}")
+    paths = {
+        "engine": root / "app" / "engine.py",
+        "storage": root / "app" / "storage.py",
+        "recovery": root / "app" / "recovery_authority.py",
+    }
+    missing = [str(path) for path in paths.values() if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"production source not found: {missing}")
 
-    engine_text = engine_path.read_text(encoding="utf-8")
-    engine_tree = ast.parse(engine_text)
-    update_node = _function_node(engine_tree, "_update_drawdown")
-    risk_node = _function_node(engine_tree, "adaptive_risk_after_drawdown")
+    texts = {name: path.read_text(encoding="utf-8") for name, path in paths.items()}
+    try:
+        trees = {name: ast.parse(text) for name, text in texts.items()}
+    except SyntaxError as exc:
+        raise RuntimeError(f"cannot parse production source during contract audit: {exc}") from exc
 
-    update_source = ast.get_source_segment(engine_text, update_node) or ""
-    risk_source = ast.get_source_segment(engine_text, risk_node) or ""
+    engine_update = _function_node(trees["engine"], "_update_drawdown")
+    engine_evaluate = _function_node(trees["engine"], "_evaluate_recovery")
+    engine_run = _function_node(trees["engine"], "run_once")
+    risk_node = _function_node(trees["engine"], "adaptive_risk_after_drawdown")
+    storage_update = _function_node(trees["storage"], "update_nav_high_water_atomic")
+    storage_recovery = _function_node(trees["storage"], "_evaluate_recovery_locked")
+    latch_reached = _function_node(trees["recovery"], "recovery_latch_reached")
+    drawdown_node = _function_node(trees["recovery"], "calculate_drawdown")
 
-    update_normalized = " ".join(update_source.split())
-    risk_normalized = " ".join(risk_source.split())
+    engine_update_source = _normalized_node_source(texts["engine"], engine_update)
+    engine_evaluate_source = _normalized_node_source(texts["engine"], engine_evaluate)
+    risk_source = _normalized_node_source(texts["engine"], risk_node)
+    storage_update_source = _normalized_node_source(texts["storage"], storage_update)
+    storage_recovery_source = _normalized_node_source(texts["storage"], storage_recovery)
+    latch_source = _normalized_node_source(texts["recovery"], latch_reached)
+    drawdown_source = _normalized_node_source(texts["recovery"], drawdown_node)
 
-    reads_persisted = (
-        'get_kv("nav_high_water"' in update_normalized
-        or "get_kv('nav_high_water'" in update_normalized
+    engine_high_water_delegation = (
+        "self.storage.update_nav_high_water_atomic(nav)" in engine_update_source
     )
-    monotonic_max = "max(current, nav)" in update_normalized
-    persists_high_water = (
-        'set_kv("nav_high_water", str(high_water))' in update_normalized
-        or "set_kv('nav_high_water', str(high_water))" in update_normalized
+    engine_recovery_delegation = (
+        "self.storage.evaluate_recovery(" in engine_evaluate_source
     )
-    drawdown_formula = "1.0 - nav / high_water" in update_normalized
+    engine_run_recovery_checks = (
+        sum(
+            1
+            for node in ast.walk(engine_run)
+            if isinstance(node, ast.Call) and _call_name(node) == "_evaluate_recovery"
+        )
+        >= 2
+    )
+
+    storage_update_reads = bool(
+        _calls_with_key(
+            storage_update,
+            call_names={"_get_kv_conn"},
+            key="nav_high_water",
+        )
+    )
+    storage_recovery_reads = bool(
+        _calls_with_key(
+            storage_recovery,
+            call_names={"_get_kv_conn"},
+            key="nav_high_water",
+        )
+    )
+    storage_update_writes = bool(
+        _calls_with_key(
+            storage_update,
+            call_names={"_set_kv_conn"},
+            key="nav_high_water",
+        )
+    )
+    storage_recovery_writes = bool(
+        _calls_with_key(
+            storage_recovery,
+            call_names={"_set_kv_conn"},
+            key="nav_high_water",
+        )
+    )
+
+    reads_persisted = storage_update_reads and storage_recovery_reads
+    monotonic_max = (
+        "high_water = max(current, nav_value)" in storage_update_source
+        and "state[\"state\"] in {STATE_ACTIVE, STATE_LATCHED_DD_STOP}"
+        in storage_recovery_source
+        and "nav_value > high_water" in storage_recovery_source
+        and "high_water = nav_value" in storage_recovery_source
+    )
+    persists_high_water = storage_update_writes and storage_recovery_writes
+    drawdown_formula = (
+        "calculate_drawdown(nav_value, high_water)" in storage_update_source
+        and "calculate_drawdown(nav_value, high_water)" in storage_recovery_source
+        and "1.0 - nav_value / high_value" in drawdown_source
+    )
     risk_zeroing = (
-        "drawdown >= settings.adaptive_drawdown_stop" in risk_normalized
-        and "return 0.0" in risk_normalized
+        "drawdown >= settings.adaptive_drawdown_stop" in risk_source
+        and "return 0.0" in risk_source
+    )
+
+    fixed_recovery_latch_10pct = (
+        _module_constant(
+            trees["recovery"], "RECOVERY_LATCH_DRAWDOWN_STOP_V1"
+        )
+        == 0.10
+        and _module_constant(
+            trees["recovery"], "RECOVERY_LATCH_DRAWDOWN_STOP_TEXT"
+        )
+        == "0.1"
+        and "RECOVERY_LATCH_DRAWDOWN_STOP_V1" in latch_source
+        and "nav_value <= recovery_boundary" in latch_source
+    )
+
+    persistent_latch_transition = (
+        "state[\"state\"] == STATE_ACTIVE" in storage_recovery_source
+        and "recovery_latch_reached(nav_value, high_water)"
+        in storage_recovery_source
+        and "latched = latched_state(" in storage_recovery_source
+        and "RECOVERY_STATE_KEY, canonical_json(latched)"
+        in storage_recovery_source
+        and "STATE_LATCHED_DD_STOP" in storage_recovery_source
+    )
+
+    parse_state_lines = [
+        int(node.lineno)
+        for node in ast.walk(storage_recovery)
+        if isinstance(node, ast.Call) and _call_name(node) == "parse_recovery_state"
+    ]
+    active_state_lines = [
+        int(node.lineno)
+        for node in ast.walk(storage_recovery)
+        if isinstance(node, ast.Call) and _call_name(node) == "active_state"
+    ]
+    persistent_latch_no_self_clear = (
+        len(parse_state_lines) == 1
+        and bool(active_state_lines)
+        and all(line < parse_state_lines[0] for line in active_state_lines)
     )
 
     nav_high_water_calls: list[dict[str, Any]] = []
     writer_calls: list[dict[str, Any]] = []
     reset_named_functions: list[str] = []
+    mutation_call_names = {"set_kv", "_set_kv_conn", "delete_kv", "_delete_kv_conn"}
 
-    for path in sorted(root.rglob("*.py")):
+    for path in sorted((root / "app").rglob("*.py")):
         if any(part in {".git", ".venv", "__pycache__"} for part in path.parts):
             continue
         text = path.read_text(encoding="utf-8")
         try:
             tree = ast.parse(text)
         except SyntaxError as exc:
-            raise RuntimeError(f"cannot parse source during contract audit: {path}: {exc}")
+            raise RuntimeError(
+                f"cannot parse source during contract audit: {path}: {exc}"
+            ) from exc
         relative = path.relative_to(root).as_posix()
 
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
-                lower = node.name.lower()
-                if ("reset" in lower or "recover" in lower or "rebaseline" in lower):
-                    segment = ast.get_source_segment(text, node) or ""
-                    if "nav_high_water" in segment:
-                        reset_named_functions.append(f"{relative}:{node.lineno}:{node.name}")
-            if not isinstance(node, ast.Call):
-                continue
-            contains_key = any(
-                isinstance(arg, ast.Constant)
-                and arg.value == "nav_high_water"
-                for arg in node.args
-            )
-            if not contains_key:
-                continue
-            name = _call_name(node)
-            row = {
-                "path": relative,
-                "line": int(getattr(node, "lineno", 0)),
-                "call": name,
-            }
-            nav_high_water_calls.append(row)
-            if name not in {"get_kv"}:
-                writer_calls.append(row)
-
-    expected_writer = {
-        "path": "app/engine.py",
-        "line": next(
-            (
-                int(node.lineno)
-                for node in ast.walk(update_node)
-                if isinstance(node, ast.Call)
-                and _call_name(node) == "set_kv"
-                and any(
-                    isinstance(arg, ast.Constant)
-                    and arg.value == "nav_high_water"
-                    for arg in node.args
+        for function in (
+            node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+        ):
+            lower = function.name.lower()
+            segment = ast.get_source_segment(text, function) or ""
+            if (
+                any(token in lower for token in ("reset", "rebaseline", "rearm", "probation"))
+                and (
+                    "nav_high_water" in segment
+                    or "RECOVERY_STATE_KEY" in segment
                 )
-            ),
-            -1,
-        ),
-        "call": "set_kv",
-    }
-    single_writer = writer_calls == [expected_writer]
-    no_reset_path = len(reset_named_functions) == 0 and single_writer
+            ):
+                reset_named_functions.append(
+                    f"{relative}:{function.lineno}:{function.name}"
+                )
+            for call in ast.walk(function):
+                if not isinstance(call, ast.Call) or not _call_has_string_arg(
+                    call, "nav_high_water"
+                ):
+                    continue
+                row = {
+                    "path": relative,
+                    "line": int(getattr(call, "lineno", 0)),
+                    "function": function.name,
+                    "call": _call_name(call),
+                }
+                nav_high_water_calls.append(row)
+                if row["call"] in mutation_call_names:
+                    writer_calls.append(row)
 
-    source_lines = engine_text.splitlines()
-    evidence_lines = [
-        {
-            "path": "app/engine.py",
-            "line": index,
-            "text": line.strip(),
-        }
-        for index, line in enumerate(source_lines, start=1)
-        if "nav_high_water" in line
-        or "adaptive_drawdown_stop" in line
-        or "high_water = max(current, nav)" in line
-    ]
+    allowed_writer_functions = {
+        ("app/storage.py", "update_nav_high_water_atomic", "_set_kv_conn"),
+        ("app/storage.py", "_evaluate_recovery_locked", "_set_kv_conn"),
+    }
+    all_high_water_writers_governed = bool(writer_calls) and all(
+        (row["path"], row["function"], row["call"]) in allowed_writer_functions
+        for row in writer_calls
+    )
+
+    future_transition_event_names = (
+        "drawdown_recovery_rebaselined",
+        "drawdown_recovery_rearmed_probation",
+        "drawdown_recovery_relatch",
+    )
+    combined_r1_source = "\n".join(
+        (texts["engine"], texts["storage"], texts["recovery"])
+    )
+    no_future_recovery_mutation = (
+        not reset_named_functions
+        and not any(name in combined_r1_source for name in future_transition_event_names)
+    )
+
+    no_reset_path = (
+        all_high_water_writers_governed
+        and persistent_latch_no_self_clear
+        and no_future_recovery_mutation
+    )
+
+    evidence_lines: list[dict[str, Any]] = []
+    evidence_tokens = (
+        "nav_high_water",
+        "update_nav_high_water_atomic",
+        "evaluate_recovery",
+        "RECOVERY_LATCH_DRAWDOWN_STOP_V1",
+        "recovery_latch_reached",
+        "STATE_LATCHED_DD_STOP",
+        "adaptive_drawdown_stop",
+    )
+    for name, path in paths.items():
+        for index, line in enumerate(texts[name].splitlines(), start=1):
+            if any(token in line for token in evidence_tokens):
+                evidence_lines.append(
+                    {
+                        "path": path.relative_to(root).as_posix(),
+                        "line": index,
+                        "text": line.strip(),
+                    }
+                )
 
     contract_ok = all(
         (
+            engine_high_water_delegation,
+            engine_recovery_delegation,
+            engine_run_recovery_checks,
             reads_persisted,
             monotonic_max,
             persists_high_water,
             drawdown_formula,
             risk_zeroing,
-            single_writer,
+            fixed_recovery_latch_10pct,
+            persistent_latch_transition,
+            persistent_latch_no_self_clear,
+            all_high_water_writers_governed,
+            no_future_recovery_mutation,
             no_reset_path,
         )
     )
     return {
         "contract_ok": contract_ok,
+        "engine_high_water_delegation": engine_high_water_delegation,
+        "engine_recovery_delegation": engine_recovery_delegation,
+        "engine_run_recovery_checks": engine_run_recovery_checks,
         "reads_persisted_nav_high_water": reads_persisted,
         "monotonic_high_water_max": monotonic_max,
         "persists_high_water": persists_high_water,
         "drawdown_formula_current_nav_vs_high_water": drawdown_formula,
         "adaptive_risk_zero_at_or_above_stop": risk_zeroing,
+        "fixed_recovery_latch_10pct": fixed_recovery_latch_10pct,
+        "persistent_latch_transition": persistent_latch_transition,
+        "persistent_latch_no_self_clear": persistent_latch_no_self_clear,
+        "all_high_water_writers_governed": all_high_water_writers_governed,
         "nav_high_water_calls": nav_high_water_calls,
         "nav_high_water_writer_calls": writer_calls,
-        "single_expected_writer": single_writer,
+        "single_expected_writer": all_high_water_writers_governed,
         "reset_named_functions_touching_nav_high_water": reset_named_functions,
+        "no_future_recovery_mutation": no_future_recovery_mutation,
         "no_automatic_reset_path_found": no_reset_path,
         "evidence_lines": evidence_lines,
     }
@@ -659,8 +850,13 @@ def write_markdown(payload: Mapping[str, Any], path: str | Path) -> None:
         "",
         "## Production / paper source contract",
         f"- contract_ok: {source['contract_ok']}",
+        f"- engine high-water delegation: {source['engine_high_water_delegation']}",
+        f"- engine Recovery delegation: {source['engine_recovery_delegation']}",
         f"- monotonic high-water: {source['monotonic_high_water_max']}",
-        f"- single expected writer: {source['single_expected_writer']}",
+        f"- all high-water writers governed: {source['all_high_water_writers_governed']}",
+        f"- fixed Recovery latch = 10%: {source['fixed_recovery_latch_10pct']}",
+        f"- persistent latch / no self-clear: {source['persistent_latch_no_self_clear']}",
+        f"- no future R1 transition mutation: {source['no_future_recovery_mutation']}",
         f"- no automatic reset path: {source['no_automatic_reset_path_found']}",
         f"- adaptive risk zero at/above stop: {source['adaptive_risk_zero_at_or_above_stop']}",
         f"- evidence lines: {source['evidence_lines']}",

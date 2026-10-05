@@ -216,80 +216,292 @@ def test_classification_inconclusive_when_terminal_conditions_incomplete() -> No
     assert label == "INCONCLUSIVE"
 
 
-def engine_source(extra: str = "") -> str:
-    return f'''
+def engine_source(
+    *,
+    high_water_delegate: bool = True,
+    recovery_delegate: bool = True,
+    risk_zeroing: bool = True,
+) -> str:
+    update = (
+        "return self.storage.update_nav_high_water_atomic(nav)"
+        if high_water_delegate
+        else "return nav, 0.0"
+    )
+    recovery = (
+        "return self.storage.evaluate_recovery(nav=nav, broker_mode='mt5_paper', "
+        "strategy_profile='adaptive_dual_regime_v1', source_commit='abc', "
+        "observed_at='now')"
+        if recovery_delegate
+        else "return {'governed': False}"
+    )
+    risk_return = "return 0.0" if risk_zeroing else "return risk_fraction"
+    return f"""
 class TradingEngine:
     def _update_drawdown(self, nav: float):
-        current = float(self.storage.get_kv("nav_high_water", str(nav)) or nav)
-        high_water = max(current, nav)
-        self.storage.set_kv("nav_high_water", str(high_water))
-        drawdown = 0.0 if high_water <= 0 else max(0.0, 1.0 - nav / high_water)
-        return high_water, drawdown
+        {update}
+
+    def _evaluate_recovery(self, nav: float, source_commit):
+        {recovery}
+
+    def run_once(self):
+        nav = 100.0
+        first = self._evaluate_recovery(nav, "abc")
+        second = self._evaluate_recovery(nav, "abc")
+        return first, second
 
 def adaptive_risk_after_drawdown(risk_fraction, drawdown, settings):
     if drawdown >= settings.adaptive_drawdown_stop:
-        return 0.0
+        {risk_return}
     return risk_fraction
+"""
+
+
+def storage_source(
+    *,
+    monotonic: bool = True,
+    self_clear: bool = False,
+    extra: str = "",
+) -> str:
+    update = (
+        "high_water = max(current, nav_value)"
+        if monotonic
+        else "high_water = nav_value"
+    )
+    self_clear_line = "state = active_state(epoch=1)" if self_clear else ""
+    return f"""
+class Storage:
+    def update_nav_high_water_atomic(self, nav: float):
+        nav_value = float(nav)
+        with self._recovery_conn() as conn:
+            raw = self._get_kv_conn(conn, "nav_high_water")
+            current = parse_positive_float_text(raw, name="nav_high_water")
+            {update}
+            self._set_kv_conn(
+                conn, "nav_high_water", canonical_float_text(high_water)
+            )
+            return high_water, calculate_drawdown(nav_value, high_water)
+
+    def _evaluate_recovery_locked(self, nav: float):
+        nav_value = float(nav)
+        with self._recovery_conn() as conn:
+            raw_state = self._get_kv_conn(conn, RECOVERY_STATE_KEY)
+            raw_high_water = self._get_kv_conn(conn, "nav_high_water")
+            if raw_state is None:
+                state = active_state(epoch=0)
+                self._set_kv_conn(
+                    conn, RECOVERY_STATE_KEY, canonical_json(state)
+                )
+                return state
+            state = parse_recovery_state(raw_state)
+            {self_clear_line}
+            high_water = parse_positive_float_text(
+                raw_high_water, name="nav_high_water"
+            )
+            if (
+                state["state"] in {{STATE_ACTIVE, STATE_LATCHED_DD_STOP}}
+                and nav_value > high_water
+            ):
+                high_water = nav_value
+                self._set_kv_conn(
+                    conn, "nav_high_water", canonical_float_text(high_water)
+                )
+            drawdown = calculate_drawdown(nav_value, high_water)
+            if (
+                state["state"] == STATE_ACTIVE
+                and recovery_latch_reached(nav_value, high_water)
+            ):
+                latched = latched_state(
+                    epoch=0,
+                    tripped_at="now",
+                    nav=nav_value,
+                    high_water=high_water,
+                    drawdown=drawdown,
+                )
+                self._set_kv_conn(
+                    conn, RECOVERY_STATE_KEY, canonical_json(latched)
+                )
+                return latched
+            return state
 
 {extra}
-'''
+"""
 
 
-def write_repo(tmp_path: Path, engine: str) -> Path:
+def recovery_source(*, threshold: str = "0.10") -> str:
+    return f"""
+RECOVERY_LATCH_DRAWDOWN_STOP_V1 = {threshold}
+RECOVERY_LATCH_DRAWDOWN_STOP_TEXT = "0.1"
+RECOVERY_STATE_KEY = "drawdown_recovery_state_v1"
+STATE_ACTIVE = "ACTIVE"
+STATE_LATCHED_DD_STOP = "LATCHED_DD_STOP"
+
+def recovery_latch_reached(nav: float, high_water: float) -> bool:
+    nav_value = float(nav)
+    high_value = float(high_water)
+    recovery_boundary = high_value * (1.0 - RECOVERY_LATCH_DRAWDOWN_STOP_V1)
+    return nav_value <= recovery_boundary
+
+def active_state(*, epoch=0):
+    return {{"state": STATE_ACTIVE, "epoch": epoch}}
+
+def latched_state(**kwargs):
+    return {{"state": STATE_LATCHED_DD_STOP, **kwargs}}
+
+def calculate_drawdown(nav_value, high_value):
+    return max(0.0, 1.0 - nav_value / high_value)
+
+def parse_positive_float_text(value, *, name):
+    return float(value)
+
+def canonical_float_text(value):
+    return repr(float(value))
+
+def canonical_json(value):
+    return str(value)
+
+def parse_recovery_state(value):
+    return value
+"""
+
+
+def write_repo(
+    tmp_path: Path,
+    *,
+    engine: str | None = None,
+    storage: str | None = None,
+    recovery: str | None = None,
+) -> Path:
     app = tmp_path / "app"
     app.mkdir()
-    (app / "engine.py").write_text(engine, encoding="utf-8")
+    (app / "engine.py").write_text(
+        engine if engine is not None else engine_source(),
+        encoding="utf-8",
+    )
+    (app / "storage.py").write_text(
+        storage if storage is not None else storage_source(),
+        encoding="utf-8",
+    )
+    (app / "recovery_authority.py").write_text(
+        recovery if recovery is not None else recovery_source(),
+        encoding="utf-8",
+    )
     return tmp_path
 
 
-def test_production_source_contract_detects_monotonic_latched_contract(tmp_path: Path) -> None:
-    repo = write_repo(tmp_path, engine_source())
+def test_production_source_contract_accepts_current_r1_repo() -> None:
+    repo = Path(audit.__file__).resolve().parents[1]
     result = audit.audit_production_source_contract(repo)
     assert result["contract_ok"] is True
+    assert result["engine_high_water_delegation"] is True
+    assert result["engine_recovery_delegation"] is True
+    assert result["engine_run_recovery_checks"] is True
     assert result["reads_persisted_nav_high_water"] is True
     assert result["monotonic_high_water_max"] is True
     assert result["persists_high_water"] is True
-    assert result["adaptive_risk_zero_at_or_above_stop"] is True
-    assert result["single_expected_writer"] is True
+    assert result["fixed_recovery_latch_10pct"] is True
+    assert result["persistent_latch_transition"] is True
+    assert result["persistent_latch_no_self_clear"] is True
+    assert result["all_high_water_writers_governed"] is True
+    assert result["no_future_recovery_mutation"] is True
     assert result["no_automatic_reset_path_found"] is True
 
 
-def test_production_source_contract_rejects_second_writer(tmp_path: Path) -> None:
-    repo = write_repo(
-        tmp_path,
-        engine_source(
-            '''
-def reset_high_water(storage):
-    storage.set_kv("nav_high_water", "0")
-'''
-        ),
+def test_production_source_contract_accepts_minimal_r1_shape(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is True
+
+
+def test_production_source_contract_rejects_rogue_high_water_writer(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "rogue.py").write_text(
+        'def reset(storage):\n'
+        '    storage.set_kv("nav_high_water", "0")\n',
+        encoding="utf-8",
     )
     result = audit.audit_production_source_contract(repo)
     assert result["contract_ok"] is False
-    assert result["single_expected_writer"] is False
-    assert result["no_automatic_reset_path_found"] is False
+    assert result["all_high_water_writers_governed"] is False
 
 
-def test_production_source_contract_rejects_missing_adaptive_zeroing(tmp_path: Path) -> None:
-    source = engine_source().replace(
-        'if drawdown >= settings.adaptive_drawdown_stop:\n        return 0.0',
-        'if drawdown >= settings.adaptive_drawdown_stop:\n        return risk_fraction',
+def test_production_source_contract_rejects_missing_adaptive_zeroing(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(
+        tmp_path,
+        engine=engine_source(risk_zeroing=False),
     )
-    repo = write_repo(tmp_path, source)
     result = audit.audit_production_source_contract(repo)
     assert result["contract_ok"] is False
     assert result["adaptive_risk_zero_at_or_above_stop"] is False
 
 
-def test_production_source_contract_rejects_non_monotonic_high_water(tmp_path: Path) -> None:
-    source = engine_source().replace(
-        "high_water = max(current, nav)",
-        "high_water = nav",
+def test_production_source_contract_rejects_non_monotonic_high_water(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(
+        tmp_path,
+        storage=storage_source(monotonic=False),
     )
-    repo = write_repo(tmp_path, source)
     result = audit.audit_production_source_contract(repo)
     assert result["contract_ok"] is False
     assert result["monotonic_high_water_max"] is False
+
+
+def test_production_source_contract_rejects_non_10pct_latch(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(
+        tmp_path,
+        recovery=recovery_source(threshold="0.20"),
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["fixed_recovery_latch_10pct"] is False
+
+
+def test_production_source_contract_rejects_latched_self_clear(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(
+        tmp_path,
+        storage=storage_source(self_clear=True),
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["persistent_latch_no_self_clear"] is False
+
+
+def test_production_source_contract_rejects_future_rearm_mutator(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(
+        tmp_path,
+        storage=storage_source(
+            extra="""
+def rearm_recovery(storage):
+    storage.set_kv(RECOVERY_STATE_KEY, "ACTIVE")
+"""
+        ),
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["no_future_recovery_mutation"] is False
+    assert result["no_automatic_reset_path_found"] is False
+
+
+def test_production_source_contract_rejects_missing_engine_recovery_delegation(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(
+        tmp_path,
+        engine=engine_source(recovery_delegate=False),
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["engine_recovery_delegation"] is False
 
 
 def test_diagnostic6_corroboration(tmp_path: Path) -> None:
@@ -360,7 +572,13 @@ def test_write_report_is_deterministic(tmp_path: Path) -> None:
         },
         "production_paper_contract": {
             "contract_ok": True,
+            "engine_high_water_delegation": True,
+            "engine_recovery_delegation": True,
             "monotonic_high_water_max": True,
+            "all_high_water_writers_governed": True,
+            "fixed_recovery_latch_10pct": True,
+            "persistent_latch_no_self_clear": True,
+            "no_future_recovery_mutation": True,
             "single_expected_writer": True,
             "no_automatic_reset_path_found": True,
             "adaptive_risk_zero_at_or_above_stop": True,
