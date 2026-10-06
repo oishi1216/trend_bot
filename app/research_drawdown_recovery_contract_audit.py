@@ -638,23 +638,55 @@ def _scope_bound_names(node: ast.AST) -> set[str]:
     return set(_scope_binding_facts(node)["bound_names"])
 
 
+def _module_name_from_relative(relative: str) -> str:
+    module = relative[:-3].replace("/", ".") if relative.endswith(".py") else relative.replace("/", ".")
+    if module.endswith(".__init__"):
+        module = module[: -len(".__init__")]
+    return module
+
+
+def _import_source_module(
+    current_module: str,
+    statement: ast.ImportFrom,
+) -> str | None:
+    if statement.level == 0:
+        return statement.module
+    package_parts = current_module.split(".")[:-1]
+    up = statement.level - 1
+    if up > len(package_parts):
+        return None
+    base_parts = package_parts[: len(package_parts) - up]
+    if statement.module:
+        base_parts.extend(statement.module.split("."))
+    return ".".join(base_parts) if base_parts else None
+
+
 def _imported_repository_bindings(
     tree: ast.Module,
     *,
-    repository_bindings: Mapping[str, ast.AST],
-) -> dict[str, ast.AST]:
+    current_module: str,
+    module_bindings_by_name: Mapping[str, Mapping[str, ast.AST]],
+) -> tuple[dict[str, ast.AST], bool]:
     imported: dict[str, ast.AST] = {}
+    has_wildcard_import = False
     for statement in tree.body:
         if not isinstance(statement, ast.ImportFrom):
             continue
+        source_module = _import_source_module(current_module, statement)
         for alias in statement.names:
             if alias.name == "*":
+                has_wildcard_import = True
                 continue
-            expression = repository_bindings.get(alias.name)
+            if source_module is None:
+                continue
+            source_bindings = module_bindings_by_name.get(source_module)
+            if source_bindings is None:
+                continue
+            expression = source_bindings.get(alias.name)
             if expression is None:
                 continue
             imported[alias.asname or alias.name] = expression
-    return imported
+    return imported, has_wildcard_import
 
 
 def _global_declared_names(tree: ast.Module) -> set[str]:
@@ -767,24 +799,123 @@ def _nested_scope_nodes(statements: Sequence[ast.stmt]) -> list[ast.AST]:
     return scopes
 
 
-def _helper_return_expressions(tree: ast.Module) -> dict[str, ast.AST]:
-    candidates: dict[str, list[ast.AST]] = {}
-    for function in (
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ):
-        returns = [
-            child.value
-            for child in ast.walk(function)
-            if isinstance(child, ast.Return) and child.value is not None
-        ]
-        if len(returns) == 1:
-            candidates.setdefault(function.name, []).append(returns[0])
+def _attribute_mutated_names(tree: ast.AST) -> set[str]:
+    names: set[str] = set()
+
+    def collect_target(target: ast.AST) -> None:
+        if isinstance(target, ast.Attribute):
+            names.add(target.attr)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                collect_target(element)
+        elif isinstance(target, ast.Starred):
+            collect_target(target.value)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                collect_target(target)
+        elif isinstance(node, ast.AnnAssign):
+            collect_target(node.target)
+        elif isinstance(node, ast.AugAssign):
+            collect_target(node.target)
+        elif isinstance(node, ast.Delete):
+            for target in node.targets:
+                collect_target(target)
+        elif (
+            isinstance(node, ast.Call)
+            and _call_name(node) == "setattr"
+            and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and isinstance(node.args[1].value, str)
+        ):
+            names.add(node.args[1].value)
+    return names
+
+
+def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
+    candidates: dict[str, list[dict[str, Any]]] = {}
+
+    def direct_returns(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> list[ast.AST]:
+        values: list[ast.AST] = []
+
+        class ReturnCollector(ast.NodeVisitor):
+            def visit_Return(self, node: ast.Return) -> None:
+                if node.value is not None:
+                    values.append(node.value)
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                return
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+                return
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                return
+
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                return
+
+        collector = ReturnCollector()
+        for statement in function.body:
+            collector.visit(statement)
+        return values
+
+    def add_helper(
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        *,
+        kind: str,
+    ) -> None:
+        returns = direct_returns(function)
+        if len(returns) != 1:
+            return
+        args = function.args
+        if (
+            args.vararg is not None
+            or args.kwarg is not None
+            or args.kwonlyargs
+            or args.defaults
+            or any(value is not None for value in args.kw_defaults)
+        ):
+            return
+        params = tuple(
+            arg.arg for arg in (*args.posonlyargs, *args.args)
+        )
+        candidates.setdefault(function.name, []).append(
+            {
+                "return": returns[0],
+                "params": params,
+                "kind": kind,
+            }
+        )
+
+    module_facts = _scope_binding_facts(tree)
+    module_global_unstable = _global_declared_names(tree)
+    attribute_unstable = _attribute_mutated_names(tree)
+
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if (
+                module_facts["binding_counts"].get(statement.name) == 1
+                and statement.name not in module_global_unstable
+            ):
+                add_helper(statement, kind="module")
+        elif isinstance(statement, ast.ClassDef):
+            class_facts = _scope_binding_facts(statement)
+            for child in statement.body:
+                if (
+                    isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and class_facts["binding_counts"].get(child.name) == 1
+                    and child.name not in attribute_unstable
+                ):
+                    add_helper(child, kind="method")
+
     return {
-        name: expressions[0]
-        for name, expressions in candidates.items()
-        if len(expressions) == 1
+        name: specs[0]
+        for name, specs in candidates.items()
+        if len(specs) == 1
     }
 
 
@@ -792,8 +923,9 @@ def _resolve_key_expression(
     expression: ast.AST,
     *,
     bindings: Mapping[str, ast.AST],
-    helper_returns: Mapping[str, ast.AST],
+    helper_returns: Mapping[str, Mapping[str, Any]],
     seen_names: frozenset[str] = frozenset(),
+    seen_helpers: frozenset[str] = frozenset(),
 ) -> tuple[str, str | None]:
     if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
         return "exact", expression.value
@@ -809,6 +941,7 @@ def _resolve_key_expression(
             bindings=bindings,
             helper_returns=helper_returns,
             seen_names=seen_names | {expression.id},
+            seen_helpers=seen_helpers,
         )
 
     if isinstance(expression, ast.JoinedStr):
@@ -842,12 +975,14 @@ def _resolve_key_expression(
             bindings=bindings,
             helper_returns=helper_returns,
             seen_names=seen_names,
+            seen_helpers=seen_helpers,
         )
         right_status, right_value = _resolve_key_expression(
             expression.right,
             bindings=bindings,
             helper_returns=helper_returns,
             seen_names=seen_names,
+            seen_helpers=seen_helpers,
         )
         if left_status == right_status == "exact":
             return "exact", f"{left_value}{right_value}"
@@ -860,14 +995,53 @@ def _resolve_key_expression(
         return "unresolved", None
 
     if isinstance(expression, ast.Call):
-        helper = helper_returns.get(_call_name(expression))
-        if helper is not None:
-            return _resolve_key_expression(
-                helper,
-                bindings=bindings,
-                helper_returns=helper_returns,
-                seen_names=seen_names,
-            )
+        helper_name = _call_name(expression)
+        helper = helper_returns.get(helper_name)
+        if helper is None or helper_name in seen_helpers:
+            return "unresolved", None
+        if any(isinstance(arg, ast.Starred) for arg in expression.args):
+            return "unresolved", None
+        if any(keyword.arg is None for keyword in expression.keywords):
+            return "unresolved", None
+
+        kind = str(helper["kind"])
+        params = list(helper["params"])
+        if isinstance(expression.func, ast.Name):
+            if kind != "module":
+                return "unresolved", None
+        elif isinstance(expression.func, ast.Attribute):
+            if (
+                kind != "method"
+                or not isinstance(expression.func.value, ast.Name)
+                or expression.func.value.id not in {"self", "cls"}
+            ):
+                return "unresolved", None
+            if params and params[0] in {"self", "cls"}:
+                params = params[1:]
+        else:
+            return "unresolved", None
+
+        argument_bindings: dict[str, ast.AST] = {}
+        if len(expression.args) > len(params):
+            return "unresolved", None
+        for name, value in zip(params, expression.args):
+            argument_bindings[name] = value
+        for keyword in expression.keywords:
+            if keyword.arg not in params or keyword.arg in argument_bindings:
+                return "unresolved", None
+            argument_bindings[keyword.arg] = keyword.value
+        if set(argument_bindings) != set(params):
+            return "unresolved", None
+
+        helper_bindings = dict(helper.get("defining_bindings", {}))
+        helper_bindings.update(argument_bindings)
+        return _resolve_key_expression(
+            helper["return"],
+            bindings=helper_bindings,
+            helper_returns=helper_returns,
+            seen_names=seen_names,
+            seen_helpers=seen_helpers | {helper_name},
+        )
 
     return "unresolved", None
 
@@ -1023,7 +1197,14 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
     processed_mutators: set[tuple[str, int, int, str]] = set()
 
     source_modules: list[
-        tuple[Path, str, str, ast.Module, dict[str, ast.AST], dict[str, ast.AST]]
+        tuple[
+            Path,
+            str,
+            str,
+            ast.Module,
+            dict[str, ast.AST],
+            dict[str, dict[str, Any]],
+        ]
     ] = []
     repository_constant_candidates: dict[str, set[str]] = {}
 
@@ -1040,6 +1221,16 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         relative = source_path.relative_to(root).as_posix()
         module_bindings = _unique_expression_bindings(source_tree)
         helper_returns = _helper_return_expressions(source_tree)
+        helper_defining_bindings = _freeze_bindings(
+            {
+                name: expression
+                for name, expression in module_bindings.items()
+                if name not in _global_declared_names(source_tree)
+            },
+            helper_returns={},
+        )
+        for helper_spec in helper_returns.values():
+            helper_spec["defining_bindings"] = helper_defining_bindings
         source_modules.append(
             (
                 source_path,
@@ -1064,6 +1255,28 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         for name, values in repository_constant_candidates.items()
         if len(values) == 1
     }
+
+    module_bindings_by_name: dict[str, dict[str, ast.AST]] = {}
+    for (
+        _source_path,
+        relative,
+        _source_text,
+        _source_tree,
+        module_bindings,
+        helper_returns,
+    ) in source_modules:
+        donor_global_unstable = _global_declared_names(_source_tree)
+        stable_module_bindings = {
+            name: expression
+            for name, expression in module_bindings.items()
+            if name not in donor_global_unstable
+        }
+        module_bindings_by_name[_module_name_from_relative(relative)] = (
+            _freeze_bindings(
+                stable_module_bindings,
+                helper_returns=helper_returns,
+            )
+        )
 
     allowed_passthrough = {
         ("app/storage.py", "set_kv", "_set_kv_conn", "key"),
@@ -1090,6 +1303,14 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             "function": function_name,
             "call": call_name,
         }
+        if (
+            any(isinstance(arg, ast.Starred) for arg in call.args)
+            or any(keyword.arg is None for keyword in call.keywords)
+        ):
+            unresolved_kv_mutators.append(
+                {**row, "reason": "ambiguous_argument_unpacking"}
+            )
+            return
         if len(call.args) <= key_index:
             unresolved_kv_mutators.append({**row, "reason": "missing_key_argument"})
             return
@@ -1136,9 +1357,12 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         module_bindings,
         helper_returns,
     ) in source_modules:
-        imported_module_bindings = _imported_repository_bindings(
-            source_tree,
-            repository_bindings=repository_bindings,
+        imported_module_bindings, has_wildcard_import = (
+            _imported_repository_bindings(
+                source_tree,
+                current_module=_module_name_from_relative(relative),
+                module_bindings_by_name=module_bindings_by_name,
+            )
         )
         module_global_unstable_names = _global_declared_names(source_tree)
 
@@ -1170,15 +1394,16 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             }
 
             if isinstance(scope_node, ast.Module):
-                for name, expression in imported_module_bindings.items():
-                    if (
-                        facts["binding_counts"].get(name) == 1
-                        and name not in module_global_unstable_names
-                    ):
-                        scope_bindings[name] = expression
-                for name, expression in module_bindings.items():
-                    if name not in module_global_unstable_names:
-                        scope_bindings[name] = expression
+                if not has_wildcard_import:
+                    for name, expression in imported_module_bindings.items():
+                        if (
+                            facts["binding_counts"].get(name) == 1
+                            and name not in module_global_unstable_names
+                        ):
+                            scope_bindings[name] = expression
+                    for name, expression in module_bindings.items():
+                        if name not in module_global_unstable_names:
+                            scope_bindings[name] = expression
                 statements = scope_node.body
             elif isinstance(scope_node, ast.ClassDef):
                 # Class-body names use LOAD_NAME semantics rather than a
@@ -1191,9 +1416,17 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                         scope_bindings[name] = expression
                 statements = scope_node.body
 
+            scope_helper_returns = helper_returns
+            if not isinstance(scope_node, ast.Module):
+                scope_helper_returns = {
+                    name: spec
+                    for name, spec in helper_returns.items()
+                    if name not in facts["bound_names"]
+                }
+
             scope_bindings = _freeze_bindings(
                 scope_bindings,
-                helper_returns=helper_returns,
+                helper_returns=scope_helper_returns,
             )
 
             if isinstance(scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1219,7 +1452,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     relative=relative,
                     function_name=scope_name,
                     bindings=scope_bindings,
-                    helper_returns=helper_returns,
+                    helper_returns=scope_helper_returns,
                 )
 
             for child_scope in _nested_scope_nodes(statements):
@@ -1243,7 +1476,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
 
         scan_scope(
             source_tree,
-            inherited_bindings=repository_bindings,
+            inherited_bindings={},
             scope_name="<module>",
         )
 

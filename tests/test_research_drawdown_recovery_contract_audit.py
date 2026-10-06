@@ -269,6 +269,8 @@ def storage_source(
     )
     self_clear_line = "state = active_state(epoch=1)" if self_clear else ""
     return f"""
+from .recovery_authority import RECOVERY_STATE_KEY
+
 class Storage:
     def update_nav_high_water_atomic(self, nav: float):
         nav_value = float(nav)
@@ -854,6 +856,248 @@ def test_production_source_contract_fails_closed_on_global_repository_fallback(
         row["path"] == "scripts/global_only.py"
         and row["reason"] == "unresolved_key_expression"
         for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_wrong_module_explicit_import(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "safe.py").write_text(
+        'KEY = "scheduled_run"\n',
+        encoding="utf-8",
+    )
+    (scripts / "dynamic.py").write_text(
+        'KEY = input()\n',
+        encoding="utf-8",
+    )
+    (scripts / "target.py").write_text(
+        'from scripts.dynamic import KEY\n'
+        'def reader(storage):\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/target.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_wildcard_import_provenance(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "safe.py").write_text(
+        'KEY = "scheduled_run"\n',
+        encoding="utf-8",
+    )
+    (scripts / "dynamic.py").write_text(
+        'KEY = input()\n',
+        encoding="utf-8",
+    )
+    (scripts / "target.py").write_text(
+        'from scripts.dynamic import *\n'
+        'def reader(storage):\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/target.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_resolves_helper_call_arguments(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "helper_argument.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def choose(KEY):\n'
+        '    return KEY\n'
+        'def reader(storage):\n'
+        '    storage.set_kv(choose("nav_high_water"), "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/helper_argument.py"
+        and row["resolved_key"] == "nav_high_water"
+        for row in result["nav_high_water_writer_calls"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_callable_shadowing(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "helper_shadow.py").write_text(
+        'def choose():\n'
+        '    return "scheduled_run"\n'
+        'def reader(storage, choose):\n'
+        '    storage.set_kv(choose(), "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/helper_shadow.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_starred_mutator_args(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "starred_mutator.py").write_text(
+        'def reader(storage, conn):\n'
+        '    storage._set_kv_conn(*[conn, "nav_high_water"], "scheduled_run")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/starred_mutator.py"
+        and row["reason"] == "ambiguous_argument_unpacking"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_unpacked_mutator_kwargs(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "kwargs_mutator.py").write_text(
+        'def reader(storage, payload):\n'
+        '    storage.set_kv("scheduled_run", "0", **payload)\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/kwargs_mutator.py"
+        and row["reason"] == "ambiguous_argument_unpacking"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_mutable_import_donor(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "donor.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def set_key(value):\n'
+        '    global KEY\n'
+        '    KEY = value\n',
+        encoding="utf-8",
+    )
+    (scripts / "target.py").write_text(
+        'from scripts.donor import KEY\n'
+        'def reader(storage):\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/target.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_module_helper_rebinding(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "helper_rebound.py").write_text(
+        'def choose():\n'
+        '    return "scheduled_run"\n'
+        'choose = lambda: "nav_high_water"\n'
+        'def reader(storage):\n'
+        '    storage.set_kv(choose(), "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/helper_rebound.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_method_helper_attribute_rebinding(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "method_helper_rebound.py").write_text(
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def reader(self, storage):\n'
+        '        self.choose = lambda: "nav_high_water"\n'
+        '        storage.set_kv(self.choose(), "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/method_helper_rebound.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_freezes_helper_dependencies_in_defining_scope(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "helper_scope.py").write_text(
+        'SAFE = "nav_high_water"\n'
+        'def choose():\n'
+        '    return SAFE\n'
+        'def reader(storage):\n'
+        '    SAFE = "scheduled_run"\n'
+        '    storage.set_kv(choose(), "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/helper_scope.py"
+        and row["resolved_key"] == "nav_high_water"
+        for row in result["nav_high_water_writer_calls"]
     )
 
 
