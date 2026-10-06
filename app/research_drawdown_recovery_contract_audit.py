@@ -1161,6 +1161,8 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                 set(facts["bound_names"])
                 | descendant_nonlocal_names
             )
+            if isinstance(scope_node, ast.Module):
+                blocked_names |= module_global_unstable_names
             scope_bindings = {
                 name: expression
                 for name, expression in inherited_bindings.items()

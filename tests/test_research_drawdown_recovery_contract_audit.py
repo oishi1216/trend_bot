@@ -829,6 +829,34 @@ def test_production_source_contract_fails_closed_on_match_pattern_capture(
     )
 
 
+def test_production_source_contract_fails_closed_on_global_repository_fallback(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "safe_key.py").write_text(
+        'KEY = "scheduled_run"\n',
+        encoding="utf-8",
+    )
+    (scripts / "global_only.py").write_text(
+        'def set_key(source):\n'
+        '    global KEY\n'
+        '    KEY = source\n'
+        'def mutate(storage, source):\n'
+        '    set_key(source)\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/global_only.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
 def test_production_source_contract_rejects_missing_adaptive_zeroing(
     tmp_path: Path,
 ) -> None:
