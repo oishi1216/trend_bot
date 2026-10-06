@@ -802,6 +802,118 @@ def _executable_calls(statements: Sequence[ast.stmt]) -> list[ast.Call]:
         collector.visit(statement)
     return calls
 
+def _mutator_callable_escape_rows(
+    statements: Sequence[ast.stmt],
+    *,
+    aliases: Mapping[str, str],
+    binding_counts: Mapping[str, int],
+    relative: str,
+    scope_name: str,
+) -> list[dict[str, Any]]:
+    references: list[tuple[ast.AST, ast.AST | None]] = []
+    imports: list[ast.ImportFrom] = []
+
+    class Collector(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.parents: list[ast.AST] = []
+
+        def visit(self, node: ast.AST) -> Any:
+            parent = self.parents[-1] if self.parents else None
+            if isinstance(node, (ast.Name, ast.Attribute)):
+                references.append((node, parent))
+            if isinstance(node, ast.ImportFrom):
+                imports.append(node)
+            self.parents.append(node)
+            try:
+                return super().visit(node)
+            finally:
+                self.parents.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for value in node.args.defaults:
+                self.visit(value)
+            for value in node.args.kw_defaults:
+                if value is not None:
+                    self.visit(value)
+            if node.returns is not None:
+                self.visit(node.returns)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self.visit_FunctionDef(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            for base in node.bases:
+                self.visit(base)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+
+    collector = Collector()
+    for statement in statements:
+        collector.visit(statement)
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, str]] = set()
+
+    def add(node: ast.AST, call_name: str, reason: str) -> None:
+        line = int(getattr(node, "lineno", 0))
+        column = int(getattr(node, "col_offset", 0))
+        identity = (line, column, reason)
+        if identity in seen:
+            return
+        seen.add(identity)
+        rows.append(
+            {
+                "path": relative,
+                "line": line,
+                "function": scope_name,
+                "call": call_name,
+                "key_status": "unresolved",
+                "resolved_key": None,
+                "reason": reason,
+            }
+        )
+
+    for statement in imports:
+        for alias in statement.names:
+            if alias.name in _MUTATOR_KEY_INDEX:
+                add(
+                    statement,
+                    alias.asname or alias.name,
+                    "mutator_callable_import_escape",
+                )
+
+    for node, parent in references:
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            continue
+        resolved = _resolved_mutator_callable_name(node, aliases)
+        if resolved is None:
+            continue
+        if isinstance(parent, ast.Call) and parent.func is node:
+            continue
+        if (
+            isinstance(parent, ast.Assign)
+            and parent.value is node
+            and len(parent.targets) == 1
+            and isinstance(parent.targets[0], ast.Name)
+            and binding_counts.get(parent.targets[0].id) == 1
+        ):
+            continue
+        if (
+            isinstance(parent, ast.AnnAssign)
+            and parent.value is node
+            and isinstance(parent.target, ast.Name)
+            and binding_counts.get(parent.target.id) == 1
+        ):
+            continue
+        add(node, resolved, "mutator_callable_escape")
+
+    return rows
+
+
 def _nested_scope_nodes(statements: Sequence[ast.stmt]) -> list[ast.AST]:
     scopes: list[ast.AST] = []
 
@@ -900,10 +1012,21 @@ def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
             collector.visit(statement)
         return values
 
+    subclass_overrides: set[tuple[str, str]] = set()
+    for statement in tree.body:
+        if not isinstance(statement, ast.ClassDef):
+            continue
+        override_names = _scope_bound_names(statement)
+        for base in statement.bases:
+            if isinstance(base, ast.Name):
+                for name in override_names:
+                    subclass_overrides.add((base.id, name))
+
     def add_helper(
         function: ast.FunctionDef | ast.AsyncFunctionDef,
         *,
         kind: str,
+        owner: str | None = None,
     ) -> None:
         if function.decorator_list:
             return
@@ -919,14 +1042,23 @@ def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
             or any(value is not None for value in args.kw_defaults)
         ):
             return
-        params = tuple(
-            arg.arg for arg in (*args.posonlyargs, *args.args)
-        )
+        params = tuple(arg.arg for arg in (*args.posonlyargs, *args.args))
+
+        local_bound_names = _scope_bound_names(function)
+        if any(
+            isinstance(call.func, ast.Name)
+            and call.func.id in local_bound_names
+            for call in ast.walk(returns[0])
+            if isinstance(call, ast.Call)
+        ):
+            return
+
         candidates.setdefault(function.name, []).append(
             {
                 "return": returns[0],
                 "params": params,
                 "kind": kind,
+                "owner": owner,
             }
         )
 
@@ -942,21 +1074,27 @@ def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
             ):
                 add_helper(statement, kind="module")
         elif isinstance(statement, ast.ClassDef):
+            if statement.decorator_list:
+                continue
             class_facts = _scope_binding_facts(statement)
             for child in statement.body:
                 if (
                     isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
                     and class_facts["binding_counts"].get(child.name) == 1
                     and child.name not in attribute_unstable
+                    and (statement.name, child.name) not in subclass_overrides
                 ):
-                    add_helper(child, kind="method")
+                    add_helper(
+                        child,
+                        kind="method",
+                        owner=statement.name,
+                    )
 
     return {
         name: specs[0]
         for name, specs in candidates.items()
         if len(specs) == 1
     }
-
 
 def _resolve_key_expression(
     expression: ast.AST,
@@ -965,6 +1103,7 @@ def _resolve_key_expression(
     helper_returns: Mapping[str, Mapping[str, Any]],
     seen_names: frozenset[str] = frozenset(),
     seen_helpers: frozenset[str] = frozenset(),
+    method_owner: str | None = None,
 ) -> tuple[str, str | None]:
     if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
         return "exact", expression.value
@@ -981,6 +1120,7 @@ def _resolve_key_expression(
             helper_returns=helper_returns,
             seen_names=seen_names | {expression.id},
             seen_helpers=seen_helpers,
+            method_owner=method_owner,
         )
 
     if isinstance(expression, ast.JoinedStr):
@@ -1015,6 +1155,7 @@ def _resolve_key_expression(
             helper_returns=helper_returns,
             seen_names=seen_names,
             seen_helpers=seen_helpers,
+            method_owner=method_owner,
         )
         right_status, right_value = _resolve_key_expression(
             expression.right,
@@ -1022,6 +1163,7 @@ def _resolve_key_expression(
             helper_returns=helper_returns,
             seen_names=seen_names,
             seen_helpers=seen_helpers,
+            method_owner=method_owner,
         )
         if left_status == right_status == "exact":
             return "exact", f"{left_value}{right_value}"
@@ -1054,10 +1196,13 @@ def _resolve_key_expression(
             if kind != "module":
                 return "unresolved", None
         elif isinstance(expression.func, ast.Attribute):
+            helper_owner = helper.get("owner")
             if (
                 kind != "method"
                 or not isinstance(expression.func.value, ast.Name)
                 or expression.func.value.id not in {"self", "cls"}
+                or helper_owner is None
+                or method_owner != helper_owner
             ):
                 return "unresolved", None
             if params and params[0] in {"self", "cls"}:
@@ -1085,10 +1230,14 @@ def _resolve_key_expression(
             helper_returns=helper_returns,
             seen_names=seen_names,
             seen_helpers=seen_helpers | {helper_name},
+            method_owner=(
+                str(helper.get("owner"))
+                if kind == "method" and helper.get("owner") is not None
+                else None
+            ),
         )
 
     return "unresolved", None
-
 
 def _source_file_is_in_scope(root: Path, path: Path) -> bool:
     relative = path.relative_to(root)
@@ -1336,6 +1485,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         bindings: Mapping[str, ast.AST],
         helper_returns: Mapping[str, ast.AST],
         resolved_call_name: str | None = None,
+        method_owner: str | None = None,
     ) -> None:
         call_name = resolved_call_name or _call_name(call)
         key_index = _MUTATOR_KEY_INDEX.get(call_name)
@@ -1368,6 +1518,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             key_expression,
             bindings=bindings,
             helper_returns=helper_returns,
+            method_owner=method_owner,
         )
         row["key_status"] = status
         row["resolved_key"] = resolved_key
@@ -1420,6 +1571,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             inherited_bindings: Mapping[str, ast.AST],
             inherited_mutator_aliases: Mapping[str, str],
             scope_name: str,
+            owner_class: str | None,
         ) -> None:
             facts = _scope_binding_facts(scope_node)
             descendant_nonlocal_names = (
@@ -1477,6 +1629,15 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             known_mutator_alias_names.setdefault(relative, set()).update(
                 scope_mutator_aliases
             )
+            unresolved_kv_mutators.extend(
+                _mutator_callable_escape_rows(
+                    statements,
+                    aliases=scope_mutator_aliases,
+                    binding_counts=facts["binding_counts"],
+                    relative=relative,
+                    scope_name=scope_name,
+                )
+            )
 
             scope_helper_returns = helper_returns
             if not isinstance(scope_node, ast.Module):
@@ -1524,6 +1685,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     bindings=scope_bindings,
                     helper_returns=scope_helper_returns,
                     resolved_call_name=resolved_call_name,
+                    method_owner=owner_class,
                 )
 
             for child_scope in _nested_scope_nodes(statements):
@@ -1539,13 +1701,20 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
 
                 if isinstance(child_scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     child_name = child_scope.name
+                    child_owner = (
+                        scope_node.name
+                        if isinstance(scope_node, ast.ClassDef)
+                        else owner_class
+                    )
                 else:
                     child_name = f"<class:{child_scope.name}>"
+                    child_owner = child_scope.name
                 scan_scope(
                     child_scope,
                     inherited_bindings=child_inherited,
                     inherited_mutator_aliases=child_mutator_aliases,
                     scope_name=child_name,
+                    owner_class=child_owner,
                 )
 
         scan_scope(
@@ -1553,6 +1722,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             inherited_bindings={},
             inherited_mutator_aliases={},
             scope_name="<module>",
+            owner_class=None,
         )
 
     for (

@@ -1216,6 +1216,179 @@ def test_production_source_contract_fails_closed_on_decorated_helper(
     )
 
 
+
+def _repair9_assert_contract_false(
+    repo: Path,
+    relative: str,
+    source: str,
+) -> dict:
+    path = repo / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(source, encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    return result
+
+
+def test_production_source_contract_fails_closed_on_mutator_alias_reassignment(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    result = _repair9_assert_contract_false(
+        repo, "scripts/alias_reassignment.py",
+        'def run(storage):\n'
+        '    write = storage.set_kv\n'
+        '    write = storage.set_kv\n'
+        '    write("nav_high_water", "0")\n',
+    )
+    assert any(row.get("reason") == "mutator_callable_escape" for row in result["unresolved_kv_mutators"])
+
+
+def test_production_source_contract_fails_closed_on_mutator_conditional_alias(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/alias_conditional.py",
+        'def run(storage, flag):\n'
+        '    if flag:\n'
+        '        write = storage.set_kv\n'
+        '    else:\n'
+        '        write = storage.set_kv\n'
+        '    write("nav_high_water", "0")\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_mutator_destructuring_alias(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/alias_destructure.py",
+        'def run(storage):\n'
+        '    write, other = storage.set_kv, None\n'
+        '    write("nav_high_water", "0")\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_mutator_attribute_escape(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/alias_attribute.py",
+        'def run(storage, box):\n'
+        '    box.write = storage.set_kv\n'
+        '    box.write("nav_high_water", "0")\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_mutator_parameter_escape(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/alias_parameter.py",
+        'def invoke(write):\n'
+        '    write("nav_high_water", "0")\n'
+        'def run(storage):\n'
+        '    invoke(storage.set_kv)\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_mutator_default_escape(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/alias_default.py",
+        'def run(storage):\n'
+        '    def invoke(write=storage.set_kv):\n'
+        '        write("nav_high_water", "0")\n'
+        '    invoke()\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_mutator_return_escape(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/alias_return.py",
+        'def obtain(storage):\n'
+        '    return storage.set_kv\n'
+        'def run(storage):\n'
+        '    write = obtain(storage)\n'
+        '    write("nav_high_water", "0")\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_mutator_expression_escape(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/alias_expression.py",
+        'def run(storage, flag):\n'
+        '    write = storage.set_kv if flag else storage.set_kv\n'
+        '    write("nav_high_water", "0")\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_helper_local_lambda(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/helper_local_lambda.py",
+        'def safe():\n'
+        '    return "scheduled_run"\n'
+        'def choose():\n'
+        '    safe = lambda: "nav_high_water"\n'
+        '    return safe()\n'
+        'def run(storage):\n'
+        '    storage.set_kv(choose(), "0")\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_helper_local_nested_function(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/helper_nested_function.py",
+        'def safe():\n'
+        '    return "scheduled_run"\n'
+        'def choose():\n'
+        '    def safe():\n'
+        '        return "nav_high_water"\n'
+        '    return safe()\n'
+        'def run(storage):\n'
+        '    storage.set_kv(choose(), "0")\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_decorated_class_method(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/decorated_class.py",
+        'def decorate(cls):\n'
+        '    return cls\n'
+        '@decorate\n'
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def run(self, storage):\n'
+        '        storage.set_kv(self.choose(), "0")\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_wrong_method_receiver(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/wrong_receiver.py",
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        'def run(self, storage):\n'
+        '    storage.set_kv(self.choose(), "0")\n',
+    )
+
+
+def test_production_source_contract_fails_closed_on_subclass_method_override(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    _repair9_assert_contract_false(
+        repo, "scripts/subclass_override.py",
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def run(self, storage):\n'
+        '        storage.set_kv(self.choose(), "0")\n'
+        'class D(C):\n'
+        '    choose = lambda self: "nav_high_water"\n',
+    )
+
+
 def test_production_source_contract_rejects_missing_adaptive_zeroing(
     tmp_path: Path,
 ) -> None:
