@@ -374,6 +374,43 @@ _EXCLUDED_SOURCE_PARTS = {
 _AUDIT_SOURCE_PATH = "app/research_drawdown_recovery_contract_audit.py"
 
 
+def _resolved_mutator_callable_name(
+    expression: ast.AST,
+    aliases: Mapping[str, str],
+) -> str | None:
+    if isinstance(expression, ast.Attribute):
+        return (
+            expression.attr
+            if expression.attr in _MUTATOR_KEY_INDEX
+            else None
+        )
+    if isinstance(expression, ast.Name):
+        if expression.id in _MUTATOR_KEY_INDEX:
+            return expression.id
+        return aliases.get(expression.id)
+    return None
+
+
+def _extend_mutator_aliases(
+    base: Mapping[str, str],
+    unique_bindings: Mapping[str, ast.AST],
+) -> dict[str, str]:
+    aliases = dict(base)
+    pending = dict(unique_bindings)
+    while pending:
+        progressed = False
+        for name, expression in list(pending.items()):
+            resolved = _resolved_mutator_callable_name(expression, aliases)
+            if resolved is None:
+                continue
+            aliases[name] = resolved
+            del pending[name]
+            progressed = True
+        if not progressed:
+            break
+    return aliases
+
+
 def _pattern_capture_names(pattern: ast.pattern) -> set[str]:
     names: set[str] = set()
     if isinstance(pattern, ast.MatchAs):
@@ -868,6 +905,8 @@ def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
         *,
         kind: str,
     ) -> None:
+        if function.decorator_list:
+            return
         returns = direct_returns(function)
         if len(returns) != 1:
             return
@@ -996,6 +1035,11 @@ def _resolve_key_expression(
 
     if isinstance(expression, ast.Call):
         helper_name = _call_name(expression)
+        if (
+            isinstance(expression.func, ast.Name)
+            and expression.func.id in bindings
+        ):
+            return "unresolved", None
         helper = helper_returns.get(helper_name)
         if helper is None or helper_name in seen_helpers:
             return "unresolved", None
@@ -1195,6 +1239,8 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
     passthrough_mutators: list[dict[str, Any]] = []
     reset_named_functions: list[str] = []
     processed_mutators: set[tuple[str, int, int, str]] = set()
+    processed_mutator_sites: set[tuple[str, int, int]] = set()
+    known_mutator_alias_names: dict[str, set[str]] = {}
 
     source_modules: list[
         tuple[
@@ -1289,14 +1335,16 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         function_name: str,
         bindings: Mapping[str, ast.AST],
         helper_returns: Mapping[str, ast.AST],
+        resolved_call_name: str | None = None,
     ) -> None:
-        call_name = _call_name(call)
+        call_name = resolved_call_name or _call_name(call)
         key_index = _MUTATOR_KEY_INDEX.get(call_name)
         if key_index is None:
             return
         line = int(getattr(call, "lineno", 0))
         column = int(getattr(call, "col_offset", 0))
         processed_mutators.add((relative, line, column, call_name))
+        processed_mutator_sites.add((relative, line, column))
         row = {
             "path": relative,
             "line": line,
@@ -1370,6 +1418,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             scope_node: ast.AST,
             *,
             inherited_bindings: Mapping[str, ast.AST],
+            inherited_mutator_aliases: Mapping[str, str],
             scope_name: str,
         ) -> None:
             facts = _scope_binding_facts(scope_node)
@@ -1390,6 +1439,11 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             scope_bindings = {
                 name: expression
                 for name, expression in inherited_bindings.items()
+                if name not in blocked_names
+            }
+            scope_mutator_aliases = {
+                name: call_name
+                for name, call_name in inherited_mutator_aliases.items()
                 if name not in blocked_names
             }
 
@@ -1415,6 +1469,14 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     if name not in descendant_nonlocal_names:
                         scope_bindings[name] = expression
                 statements = scope_node.body
+
+            scope_mutator_aliases = _extend_mutator_aliases(
+                scope_mutator_aliases,
+                facts["unique_bindings"],
+            )
+            known_mutator_alias_names.setdefault(relative, set()).update(
+                scope_mutator_aliases
+            )
 
             scope_helper_returns = helper_returns
             if not isinstance(scope_node, ast.Module):
@@ -1447,12 +1509,21 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     )
 
             for call in _executable_calls(statements):
+                resolved_call_name = _call_name(call)
+                if resolved_call_name not in _MUTATOR_KEY_INDEX:
+                    resolved_call_name = _resolved_mutator_callable_name(
+                        call.func,
+                        scope_mutator_aliases,
+                    )
+                if resolved_call_name is None:
+                    continue
                 inspect_mutator(
                     call=call,
                     relative=relative,
                     function_name=scope_name,
                     bindings=scope_bindings,
                     helper_returns=scope_helper_returns,
+                    resolved_call_name=resolved_call_name,
                 )
 
             for child_scope in _nested_scope_nodes(statements):
@@ -1461,8 +1532,10 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     # over the class namespace. They may still close over the
                     # lexical scope that contains the class itself.
                     child_inherited = inherited_bindings
+                    child_mutator_aliases = inherited_mutator_aliases
                 else:
                     child_inherited = scope_bindings
+                    child_mutator_aliases = scope_mutator_aliases
 
                 if isinstance(child_scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     child_name = child_scope.name
@@ -1471,12 +1544,14 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                 scan_scope(
                     child_scope,
                     inherited_bindings=child_inherited,
+                    inherited_mutator_aliases=child_mutator_aliases,
                     scope_name=child_name,
                 )
 
         scan_scope(
             source_tree,
             inherited_bindings={},
+            inherited_mutator_aliases={},
             scope_name="<module>",
         )
 
@@ -1492,25 +1567,30 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             node for node in ast.walk(source_tree) if isinstance(node, ast.Call)
         ):
             call_name = _call_name(call)
-            if call_name not in _MUTATOR_KEY_INDEX:
-                continue
-            identity = (
-                relative,
-                int(getattr(call, "lineno", 0)),
-                int(getattr(call, "col_offset", 0)),
-                call_name,
+            is_alias_call = (
+                isinstance(call.func, ast.Name)
+                and call.func.id
+                in known_mutator_alias_names.get(relative, set())
             )
-            if identity in processed_mutators:
+            if call_name not in _MUTATOR_KEY_INDEX and not is_alias_call:
+                continue
+            line = int(getattr(call, "lineno", 0))
+            column = int(getattr(call, "col_offset", 0))
+            if (relative, line, column) in processed_mutator_sites:
                 continue
             unresolved_kv_mutators.append(
                 {
                     "path": relative,
-                    "line": identity[1],
+                    "line": line,
                     "function": "<unscanned-lexical-scope>",
                     "call": call_name,
                     "key_status": "unresolved",
                     "resolved_key": None,
-                    "reason": "unscanned_lexical_scope",
+                    "reason": (
+                        "unscanned_mutator_alias"
+                        if is_alias_call
+                        else "unscanned_lexical_scope"
+                    ),
                 }
             )
 

@@ -1101,6 +1101,121 @@ def test_production_source_contract_freezes_helper_dependencies_in_defining_scop
     )
 
 
+def test_production_source_contract_rejects_mutator_callable_alias(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "mutator_alias.py").write_text(
+        'def reader(storage):\n'
+        '    write = storage.set_kv\n'
+        '    write("nav_high_water", "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/mutator_alias.py"
+        and row["call"] == "set_kv"
+        and row["resolved_key"] == "nav_high_water"
+        for row in result["nav_high_water_writer_calls"]
+    )
+
+
+def test_production_source_contract_rejects_mutator_alias_chain(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "mutator_alias_chain.py").write_text(
+        'def reader(storage):\n'
+        '    write = storage.set_kv\n'
+        '    again = write\n'
+        '    again("nav_high_water", "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/mutator_alias_chain.py"
+        and row["resolved_key"] == "nav_high_water"
+        for row in result["nav_high_water_writer_calls"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_alias_in_lambda(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "mutator_alias_lambda.py").write_text(
+        'def reader(storage):\n'
+        '    write = storage.set_kv\n'
+        '    run = lambda: write("nav_high_water", "0")\n'
+        '    run()\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/mutator_alias_lambda.py"
+        and row["reason"] == "unscanned_mutator_alias"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_helper_callable_parameter(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "helper_callable_parameter.py").write_text(
+        'def safe():\n'
+        '    return "scheduled_run"\n'
+        'def choose(safe):\n'
+        '    return safe()\n'
+        'def reader(storage):\n'
+        '    storage.set_kv(choose(lambda: "nav_high_water"), "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/helper_callable_parameter.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_production_source_contract_fails_closed_on_decorated_helper(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "decorated_helper.py").write_text(
+        'def decorate(fn):\n'
+        '    return lambda: "nav_high_water"\n'
+        '@decorate\n'
+        'def choose():\n'
+        '    return "scheduled_run"\n'
+        'def reader(storage):\n'
+        '    storage.set_kv(choose(), "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["path"] == "scripts/decorated_helper.py"
+        and row["reason"] == "unresolved_key_expression"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
 def test_production_source_contract_rejects_missing_adaptive_zeroing(
     tmp_path: Path,
 ) -> None:
