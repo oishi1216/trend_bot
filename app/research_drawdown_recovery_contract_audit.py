@@ -4,6 +4,7 @@ import argparse
 import ast
 import json
 import math
+import re
 import sys
 from collections import Counter
 from datetime import datetime
@@ -364,6 +365,7 @@ _MUTATOR_KEY_INDEX = {
     "_set_kv_conn": 1,
     "_delete_kv_conn": 1,
 }
+_SQL_CALL_NAMES = {"execute", "executemany", "executescript"}
 _EXCLUDED_SOURCE_PARTS = {
     ".git",
     ".venv",
@@ -410,6 +412,167 @@ def _extend_mutator_aliases(
             break
     return aliases
 
+
+def _static_string_value(expression: ast.AST) -> str | None:
+    if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
+        return expression.value
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+        left = _static_string_value(expression.left)
+        right = _static_string_value(expression.right)
+        if left is not None and right is not None:
+            return left + right
+    if isinstance(expression, ast.JoinedStr):
+        parts: list[str] = []
+        for value in expression.values:
+            if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+                return None
+            parts.append(value.value)
+        return "".join(parts)
+    return None
+
+
+def _resolved_sql_callable_name(
+    expression: ast.AST,
+    aliases: Mapping[str, str],
+) -> str | None:
+    if isinstance(expression, ast.Attribute):
+        return expression.attr if expression.attr in _SQL_CALL_NAMES else None
+    if isinstance(expression, ast.Name):
+        if expression.id in _SQL_CALL_NAMES:
+            return expression.id
+        return aliases.get(expression.id)
+    if (
+        isinstance(expression, ast.Call)
+        and _call_name(expression) in {"getattr", "getattribute", "__getattribute__"}
+    ):
+        method_lookup = (
+            isinstance(expression.func, ast.Attribute)
+            and _call_name(expression) in {"getattribute", "__getattribute__"}
+            and len(expression.args) == 1
+        )
+        index = 0 if method_lookup else 1
+        attribute = (
+            expression.args[index]
+            if len(expression.args) > index
+            else next(
+                (kw.value for kw in expression.keywords if kw.arg == "name"),
+                None,
+            )
+        )
+        if (
+            isinstance(attribute, ast.Constant)
+            and isinstance(attribute.value, str)
+            and attribute.value in _SQL_CALL_NAMES
+        ):
+            return attribute.value
+    return None
+
+
+def _extend_sql_aliases(
+    base: Mapping[str, str],
+    unique_bindings: Mapping[str, ast.AST],
+) -> dict[str, str]:
+    aliases = dict(base)
+    pending = dict(unique_bindings)
+    while pending:
+        progressed = False
+        for name, expression in list(pending.items()):
+            resolved = _resolved_sql_callable_name(expression, aliases)
+            if resolved is None:
+                continue
+            aliases[name] = resolved
+            del pending[name]
+            progressed = True
+        if not progressed:
+            break
+    return aliases
+
+
+def _normalized_sql(sql_text: str) -> str:
+    without_comments = re.sub(
+        r"--[^\n]*|/\*.*?\*/",
+        " ",
+        sql_text,
+        flags=re.DOTALL,
+    )
+    unquoted_identifiers = (
+        without_comments.replace('"', "")
+        .replace(chr(96), "")
+        .replace("[", "")
+        .replace("]", "")
+    )
+    return " ".join(unquoted_identifiers.casefold().split())
+
+
+def _is_allowed_busy_timeout_pragma(expression: ast.AST) -> bool:
+    if not isinstance(expression, ast.JoinedStr) or len(expression.values) != 2:
+        return False
+    prefix, formatted = expression.values
+    if (
+        not isinstance(prefix, ast.Constant)
+        or prefix.value != "PRAGMA busy_timeout="
+        or not isinstance(formatted, ast.FormattedValue)
+        or not isinstance(formatted.value, ast.Call)
+        or not isinstance(formatted.value.func, ast.Name)
+        or formatted.value.func.id != "int"
+        or len(formatted.value.args) != 1
+        or not isinstance(formatted.value.args[0], ast.Name)
+        or formatted.value.args[0].id != "RECOVERY_SQLITE_BUSY_TIMEOUT_MS"
+    ):
+        return False
+    return True
+
+
+def _sql_mutation_escape_reason(
+    call: ast.Call,
+    *,
+    relative: str,
+    scope_name: str,
+    resolved_call_name: str | None = None,
+) -> str | None:
+    call_name = resolved_call_name or _call_name(call)
+    if call_name not in _SQL_CALL_NAMES:
+        return None
+    if not call.args:
+        return "dynamic_sql_mutation_surface"
+
+    sql_text = _static_string_value(call.args[0])
+    if sql_text is None:
+        if (
+            call_name == "execute"
+            and relative == "app/storage.py"
+            and scope_name == "_recovery_conn"
+            and _is_allowed_busy_timeout_pragma(call.args[0])
+        ):
+            return None
+        return "dynamic_sql_mutation_surface"
+
+    normalized = _normalized_sql(sql_text)
+    mentions_kv = bool(
+        re.search(r"(?<![\w])(?:[a-z_][\w]*\.)?kv(?![\w])", normalized)
+    )
+    mutates_schema_or_rows = bool(
+        re.search(
+            r"\b(?:insert|replace|update|delete|drop|alter)\b"
+            r"|\bcreate\s+trigger\b",
+            normalized,
+        )
+    )
+    if not (mentions_kv and mutates_schema_or_rows):
+        return None
+
+    allowed_set = bool(
+        call_name == "execute"
+        and relative == "app/storage.py"
+        and scope_name == "_set_kv_conn"
+        and re.fullmatch(
+            r"insert\s+or\s+replace\s+into\s+kv\s*"
+            r"\(\s*key\s*,\s*value\s*\)\s*"
+            r"values\s*\(\s*\?\s*,\s*\?\s*\)\s*;?",
+            normalized,
+        )
+    )
+    return None if allowed_set else "raw_sql_kv_write"
 
 def _pattern_capture_names(pattern: ast.pattern) -> set[str]:
     names: set[str] = set()
@@ -802,6 +965,99 @@ def _executable_calls(statements: Sequence[ast.stmt]) -> list[ast.Call]:
         collector.visit(statement)
     return calls
 
+
+def _sql_callable_escape_rows(
+    statements: Sequence[ast.stmt],
+    *,
+    aliases: Mapping[str, str],
+    relative: str,
+    scope_name: str,
+) -> list[dict[str, Any]]:
+    references: list[tuple[ast.AST, ast.AST | None]] = []
+
+    class Collector(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.parents: list[ast.AST] = []
+
+        def visit(self, node: ast.AST) -> Any:
+            parent = self.parents[-1] if self.parents else None
+            if isinstance(node, (ast.Attribute, ast.Call)):
+                references.append((node, parent))
+            self.parents.append(node)
+            try:
+                return super().visit(node)
+            finally:
+                self.parents.pop()
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+    collector = Collector()
+    for statement in statements:
+        collector.visit(statement)
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add(node: ast.AST) -> None:
+        identity = (
+            int(getattr(node, "lineno", 0)),
+            int(getattr(node, "col_offset", 0)),
+        )
+        if identity in seen:
+            return
+        seen.add(identity)
+        rows.append(
+            {
+                "path": relative,
+                "line": identity[0],
+                "function": scope_name,
+                "call": "sql_callable",
+                "key_status": "unresolved",
+                "resolved_key": None,
+                "reason": "sql_callable_escape",
+            }
+        )
+
+    for node, parent in references:
+        resolved = _resolved_sql_callable_name(node, aliases)
+        if resolved is None:
+            if (
+                isinstance(node, ast.Call)
+                and _call_name(node) == "partial"
+                and node.args
+                and _resolved_sql_callable_name(node.args[0], aliases)
+                is not None
+            ):
+                add(node)
+            continue
+        if isinstance(parent, ast.Call) and parent.func is node:
+            continue
+        if (
+            isinstance(parent, ast.Assign)
+            and parent.value is node
+            and len(parent.targets) == 1
+            and isinstance(parent.targets[0], ast.Name)
+            and aliases.get(parent.targets[0].id) == resolved
+        ):
+            continue
+        if (
+            isinstance(parent, ast.AnnAssign)
+            and parent.value is node
+            and isinstance(parent.target, ast.Name)
+            and aliases.get(parent.target.id) == resolved
+        ):
+            continue
+        add(node)
+    return rows
+
+
 def _mutator_callable_escape_rows(
     statements: Sequence[ast.stmt],
     *,
@@ -812,7 +1068,9 @@ def _mutator_callable_escape_rows(
     allow_local_aliases: bool = False,
     bindings: Mapping[str, ast.AST] | None = None,
 ) -> list[dict[str, Any]]:
-    references: list[tuple[ast.AST, ast.AST | None]] = []
+    references: list[
+        tuple[ast.AST, ast.AST | None, ast.AST | None]
+    ] = []
     imports: list[ast.ImportFrom] = []
 
     class Collector(ast.NodeVisitor):
@@ -821,8 +1079,9 @@ def _mutator_callable_escape_rows(
 
         def visit(self, node: ast.AST) -> Any:
             parent = self.parents[-1] if self.parents else None
-            if isinstance(node, (ast.Name, ast.Attribute, ast.Call)):
-                references.append((node, parent))
+            grandparent = self.parents[-2] if len(self.parents) >= 2 else None
+            if isinstance(node, (ast.Name, ast.Attribute, ast.Call, ast.Subscript)):
+                references.append((node, parent, grandparent))
             if isinstance(node, ast.ImportFrom):
                 imports.append(node)
             self.parents.append(node)
@@ -879,6 +1138,7 @@ def _mutator_callable_escape_rows(
             }
         )
 
+    operator_lookup_names = {"attrgetter", "methodcaller"}
     for statement in imports:
         for alias in statement.names:
             if alias.name in _MUTATOR_KEY_INDEX:
@@ -887,6 +1147,11 @@ def _mutator_callable_escape_rows(
                     alias.asname or alias.name,
                     "mutator_callable_import_escape",
                 )
+            if (
+                statement.module == "operator"
+                and alias.name in {"attrgetter", "methodcaller"}
+            ):
+                operator_lookup_names.add(alias.asname or alias.name)
 
     invoked_names = {
         call.func.id
@@ -894,36 +1159,165 @@ def _mutator_callable_escape_rows(
         for call in ast.walk(statement)
         if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
     }
-    for node, parent in references:
+    alias_sources: dict[str, str] = {}
+    invoked_attributes = {
+        (ast.unparse(call.func.value), call.func.attr)
+        for statement in statements
+        for call in ast.walk(statement)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+    }
+    for statement in statements:
+        for node in ast.walk(statement):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Name)
+            ):
+                alias_sources[node.targets[0].id] = node.value.id
+            elif (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and isinstance(node.value, ast.Name)
+            ):
+                alias_sources[node.target.id] = node.value.id
+    changed = True
+    while changed:
+        changed = False
+        for target, source_name in alias_sources.items():
+            if target in invoked_names and source_name not in invoked_names:
+                invoked_names.add(source_name)
+                changed = True
+
+    def assigned_targets(
+        parent: ast.AST | None,
+    ) -> tuple[set[str], set[tuple[str, str]]]:
+        names: set[str] = set()
+        attrs: set[tuple[str, str]] = set()
+        targets: list[ast.AST] = []
+        if isinstance(parent, ast.Assign):
+            targets.extend(parent.targets)
+        elif isinstance(parent, ast.AnnAssign):
+            targets.append(parent.target)
+        for target in targets:
+            names.update(_assignment_target_names(target))
+            if isinstance(target, ast.Attribute):
+                attrs.add((ast.unparse(target.value), target.attr))
+        return names, attrs
+
+    def dict_lookup_surface(expression: ast.AST) -> bool:
+        return (
+            isinstance(expression, ast.Attribute)
+            and expression.attr == "__dict__"
+        ) or (
+            isinstance(expression, ast.Call)
+            and _call_name(expression) in {"vars", "globals"}
+        )
+
+    for node, parent, grandparent in references:
         if isinstance(node, ast.Call):
-            # Lookup hooks and descriptor semantics are not modeled.
-            if _call_name(node) in {"getattr", "getattribute", "__getattribute__"}:
-                index = (
-                    0 if isinstance(node.func, ast.Attribute)
-                    and _call_name(node) in {"getattribute", "__getattribute__"}
-                    and len(node.args) == 1 else 1
+            call_name = _call_name(node)
+            if (
+                isinstance(parent, ast.Call)
+                and parent.func is node
+                and node.args
+                and call_name not in _MUTATOR_KEY_INDEX
+            ):
+                status, key = _resolve_key_expression(
+                    node.args[0],
+                    bindings=bindings or {},
+                    helper_returns={},
                 )
+                if status == "exact" and key in _MUTATOR_KEY_INDEX:
+                    add(
+                        node,
+                        call_name or "<callable-factory>",
+                        "mutator_dynamic_attribute_escape",
+                    )
+                    continue
+            effective_lookup_name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                and node.func.id in operator_lookup_names
+                else call_name
+            )
+            if effective_lookup_name in operator_lookup_names:
+                attribute = node.args[0] if node.args else None
+                status, key = _resolve_key_expression(
+                    attribute, bindings=bindings or {}, helper_returns={}
+                )
+                if status != "exact" or key in _MUTATOR_KEY_INDEX:
+                    add(node, effective_lookup_name, "mutator_dynamic_attribute_escape")
+                continue
+
+            if (
+                call_name == "get"
+                and isinstance(node.func, ast.Attribute)
+                and dict_lookup_surface(node.func.value)
+            ):
+                attribute = node.args[0] if node.args else None
+                status, key = _resolve_key_expression(
+                    attribute, bindings=bindings or {}, helper_returns={}
+                )
+                if status != "exact" or key in _MUTATOR_KEY_INDEX:
+                    add(node, "dict.get", "mutator_dynamic_attribute_escape")
+                continue
+
+            if call_name in {"getattr", "getattribute", "__getattribute__"}:
+                method_lookup = (
+                    isinstance(node.func, ast.Attribute)
+                    and call_name in {"getattribute", "__getattribute__"}
+                    and len(node.args) == 1
+                )
+                index = 0 if method_lookup else 1
                 attribute = node.args[index] if len(node.args) > index else next(
                     (kw.value for kw in node.keywords if kw.arg == "name"), None
                 )
                 status, key = _resolve_key_expression(
                     attribute, bindings=bindings or {}, helper_returns={}
                 )
-                assigned_names = (
-                    set().union(*(
-                        _assignment_target_names(target) for target in parent.targets
-                    )) if isinstance(parent, ast.Assign) else
-                    _assignment_target_names(parent.target)
-                    if isinstance(parent, ast.AnnAssign) else set()
-                )
+                assigned_names, assigned_attrs = assigned_targets(parent)
                 callable_use = (
                     isinstance(parent, ast.Call) and parent.func is node
-                ) or bool(assigned_names & invoked_names)
+                ) or bool(assigned_names & invoked_names) or bool(
+                    assigned_attrs & invoked_attributes
+                )
+                no_default_dynamic_lookup = method_lookup or (
+                    len(node.args) <= 2
+                    and not any(kw.arg == "default" for kw in node.keywords)
+                )
+                escapes_scope = (
+                    isinstance(parent, ast.Return)
+                    or (
+                        isinstance(parent, ast.Call)
+                        and parent.func is not node
+                    )
+                    or (
+                        isinstance(parent, ast.keyword)
+                        and isinstance(grandparent, ast.Call)
+                    )
+                )
                 if (status == "exact" and key in _MUTATOR_KEY_INDEX) or (
-                    status != "exact" and callable_use
+                    status != "exact"
+                    and (
+                        callable_use
+                        or (no_default_dynamic_lookup and escapes_scope)
+                    )
                 ):
-                    add(node, _call_name(node), "mutator_dynamic_attribute_escape")
+                    add(node, call_name, "mutator_dynamic_attribute_escape")
             continue
+
+        if isinstance(node, ast.Subscript) and dict_lookup_surface(node.value):
+            status, key = _resolve_key_expression(
+                node.slice, bindings=bindings or {}, helper_returns={}
+            )
+            callable_use = isinstance(parent, ast.Call) and parent.func is node
+            if (status == "exact" and key in _MUTATOR_KEY_INDEX) or (
+                status != "exact" and callable_use
+            ):
+                add(node, "__dict__/vars", "mutator_dynamic_attribute_escape")
+            continue
+
         if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
             continue
         resolved = _resolved_mutator_callable_name(node, aliases)
@@ -951,7 +1345,6 @@ def _mutator_callable_escape_rows(
         add(node, resolved, "mutator_callable_escape")
 
     return rows
-
 
 def _nested_scope_nodes(statements: Sequence[ast.stmt]) -> list[ast.AST]:
     scopes: list[ast.AST] = []
@@ -993,6 +1386,23 @@ def _attribute_mutated_names(tree: ast.AST) -> set[str]:
     def collect_target(target: ast.AST) -> None:
         if isinstance(target, ast.Attribute):
             names.add(target.attr)
+        elif isinstance(target, ast.Subscript):
+            receiver_dict = (
+                isinstance(target.value, ast.Attribute)
+                and target.value.attr == "__dict__"
+            )
+            receiver_vars = (
+                isinstance(target.value, ast.Call)
+                and _call_name(target.value) in {"vars", "globals"}
+            )
+            if receiver_dict or receiver_vars:
+                if (
+                    isinstance(target.slice, ast.Constant)
+                    and isinstance(target.slice.value, str)
+                ):
+                    names.add(target.slice.value)
+                else:
+                    names.add("*")
         elif isinstance(target, (ast.Tuple, ast.List)):
             for element in target.elts:
                 collect_target(element)
@@ -1014,14 +1424,68 @@ def _attribute_mutated_names(tree: ast.AST) -> set[str]:
             isinstance(node, ast.Call)
             and _call_name(node) == "setattr"
             and len(node.args) >= 2
-            and isinstance(node.args[1], ast.Constant)
-            and isinstance(node.args[1].value, str)
         ):
-            names.add(node.args[1].value)
+            if (
+                isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                names.add(node.args[1].value)
+            else:
+                names.add("*")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "__setattr__"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in {"object", "type"}
+            and len(node.args) >= 2
+        ):
+            if (
+                isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                names.add(node.args[1].value)
+            else:
+                names.add("*")
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"update", "setdefault"}
+        ):
+            mapping = node.func.value
+            receiver_dict = (
+                isinstance(mapping, ast.Attribute)
+                and mapping.attr == "__dict__"
+            )
+            receiver_vars = (
+                isinstance(mapping, ast.Call)
+                and _call_name(mapping) in {"vars", "globals"}
+            )
+            if receiver_dict or receiver_vars:
+                if node.func.attr == "setdefault" and node.args:
+                    key = node.args[0]
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        names.add(key.value)
+                    else:
+                        names.add("*")
+                elif node.args and isinstance(node.args[0], ast.Dict):
+                    for key in node.args[0].keys:
+                        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                            names.add(key.value)
+                        else:
+                            names.add("*")
+                else:
+                    names.add("*")
     return names
 
 
-def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
+def _helper_return_expressions(
+    tree: ast.Module,
+    *,
+    repository_base_names: set[str] | frozenset[str] = frozenset(),
+    repository_attribute_unstable: set[str] | frozenset[str] = frozenset(),
+    repository_class_qualified_names: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, dict[str, Any]]:
     candidates: dict[str, list[dict[str, Any]]] = {}
 
     def direct_returns(
@@ -1157,17 +1621,32 @@ def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
 
     module_facts = _scope_binding_facts(tree)
     module_global_unstable = _global_declared_names(tree)
-    attribute_unstable = _attribute_mutated_names(tree)
+    attribute_unstable = (
+        _attribute_mutated_names(tree) | set(repository_attribute_unstable)
+    )
 
     for statement in tree.body:
         if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if (
                 module_facts["binding_counts"].get(statement.name) == 1
                 and statement.name not in module_global_unstable
+                and statement.name not in repository_attribute_unstable
+                and "*" not in repository_attribute_unstable
             ):
                 add_helper(statement, kind="module")
         elif isinstance(statement, ast.ClassDef):
-            if statement.name in unsafe_dispatch:
+            class_bound_names = _scope_bound_names(statement)
+            class_lookup_unstable = bool(
+                class_bound_names & {"__getattribute__", "__getattr__"}
+            )
+            if (
+                statement.name in unsafe_dispatch
+                or statement.name in repository_base_names
+                or statement.name in repository_class_qualified_names
+                or bool(statement.bases)
+                or class_lookup_unstable
+                or "*" in attribute_unstable
+            ):
                 continue
             class_facts = _scope_binding_facts(statement)
             for child in statement.body:
@@ -1494,6 +1973,112 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         ]
     ] = []
     repository_constant_candidates: dict[str, set[str]] = {}
+    repository_base_names: set[str] = set()
+    repository_attribute_unstable: set[str] = set()
+    repository_class_qualified_names: set[str] = set()
+
+    for source_path in sorted(root.rglob("*.py")):
+        if not _source_file_is_in_scope(root, source_path):
+            continue
+        source_text = source_path.read_text(encoding="utf-8")
+        try:
+            source_tree = ast.parse(source_text)
+        except SyntaxError as exc:
+            raise RuntimeError(
+                f"cannot parse source during contract audit: {source_path}: {exc}"
+            ) from exc
+
+        repository_attribute_unstable.update(
+            _attribute_mutated_names(source_tree)
+        )
+
+        symbols: dict[str, str] = {}
+        pending_symbols: dict[str, ast.AST] = {}
+        for statement in source_tree.body:
+            if isinstance(statement, ast.ClassDef):
+                symbols[statement.name] = statement.name
+            elif isinstance(statement, ast.ImportFrom):
+                for alias in statement.names:
+                    symbols[alias.asname or alias.name] = alias.name
+            elif (
+                isinstance(statement, ast.Assign)
+                and len(statement.targets) == 1
+                and isinstance(statement.targets[0], ast.Name)
+            ):
+                pending_symbols[statement.targets[0].id] = statement.value
+            elif (
+                isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.target, ast.Name)
+                and statement.value is not None
+            ):
+                pending_symbols[statement.target.id] = statement.value
+
+        while pending_symbols:
+            progressed = False
+            for name, expression in list(pending_symbols.items()):
+                resolved: str | None = None
+                if isinstance(expression, ast.Name):
+                    resolved = symbols.get(expression.id)
+                elif isinstance(expression, ast.Attribute):
+                    resolved = expression.attr
+                if resolved is None:
+                    continue
+                symbols[name] = resolved
+                del pending_symbols[name]
+                progressed = True
+            if not progressed:
+                break
+
+        def resolved_symbol(expression: ast.AST) -> str | None:
+            if isinstance(expression, ast.Name):
+                return symbols.get(expression.id, expression.id)
+            if isinstance(expression, ast.Attribute):
+                return expression.attr
+            return None
+
+        for class_node in (
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.ClassDef)
+        ):
+            for base in class_node.bases:
+                resolved = resolved_symbol(base)
+                if resolved is not None:
+                    repository_base_names.add(resolved)
+                else:
+                    for child in ast.walk(base):
+                        resolved_child = resolved_symbol(child)
+                        if resolved_child is not None:
+                            repository_base_names.add(resolved_child)
+
+        for call in (
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.Call)
+        ):
+            call_name = _call_name(call)
+            if call_name == "type" and len(call.args) >= 2:
+                for child in ast.walk(call.args[1]):
+                    resolved = resolved_symbol(child)
+                    if resolved is not None:
+                        repository_base_names.add(resolved)
+            elif call_name == "new_class" and len(call.args) >= 2:
+                for child in ast.walk(call.args[1]):
+                    resolved = resolved_symbol(child)
+                    if resolved is not None:
+                        repository_base_names.add(resolved)
+            if call_name in {"getattr", "vars"} and call.args:
+                resolved = resolved_symbol(call.args[0])
+                if resolved is not None:
+                    repository_class_qualified_names.add(resolved)
+
+        for node in ast.walk(source_tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.ctx, ast.Load)
+                and isinstance(node.value, ast.Name)
+            ):
+                resolved = symbols.get(node.value.id)
+                if resolved is not None:
+                    repository_class_qualified_names.add(resolved)
 
     for source_path in sorted(root.rglob("*.py")):
         if not _source_file_is_in_scope(root, source_path):
@@ -1506,8 +2091,18 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                 f"cannot parse source during contract audit: {source_path}: {exc}"
             ) from exc
         relative = source_path.relative_to(root).as_posix()
-        module_bindings = _unique_expression_bindings(source_tree)
-        helper_returns = _helper_return_expressions(source_tree)
+        module_bindings = {
+            name: expression
+            for name, expression in _unique_expression_bindings(source_tree).items()
+            if name not in repository_attribute_unstable
+            and "*" not in repository_attribute_unstable
+        }
+        helper_returns = _helper_return_expressions(
+            source_tree,
+            repository_base_names=repository_base_names,
+            repository_attribute_unstable=repository_attribute_unstable,
+            repository_class_qualified_names=repository_class_qualified_names,
+        )
         helper_defining_bindings = _freeze_bindings(
             {
                 name: expression
@@ -1674,6 +2269,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                 receiver = positional[0].arg if positional else None
                 if (
                     receiver in {"self", "cls"}
+                    and not scope_node.decorator_list
                     and facts["binding_counts"].get(receiver) == 1
                     and receiver not in _descendant_nonlocal_names(scope_node)
                     and receiver not in module_global_unstable_names
@@ -1731,8 +2327,24 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                 scope_mutator_aliases,
                 facts["unique_bindings"],
             )
+            scope_sql_aliases = _extend_sql_aliases(
+                {},
+                scope_bindings,
+            )
+            scope_sql_aliases = _extend_sql_aliases(
+                scope_sql_aliases,
+                facts["unique_bindings"],
+            )
             known_mutator_alias_names.setdefault(relative, set()).update(
                 scope_mutator_aliases
+            )
+            unresolved_kv_mutators.extend(
+                _sql_callable_escape_rows(
+                    statements,
+                    aliases=scope_sql_aliases,
+                    relative=relative,
+                    scope_name=scope_name,
+                )
             )
             unresolved_kv_mutators.extend(
                 _mutator_callable_escape_rows(
@@ -1779,6 +2391,29 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     )
 
             for call in _executable_calls(statements):
+                resolved_sql_call_name = _resolved_sql_callable_name(
+                    call.func,
+                    scope_sql_aliases,
+                )
+                sql_escape_reason = _sql_mutation_escape_reason(
+                    call,
+                    relative=relative,
+                    scope_name=scope_name,
+                    resolved_call_name=resolved_sql_call_name,
+                )
+                if sql_escape_reason is not None:
+                    unresolved_kv_mutators.append(
+                        {
+                            "path": relative,
+                            "line": int(getattr(call, "lineno", 0)),
+                            "function": scope_name,
+                            "call": _call_name(call),
+                            "key_status": "unresolved",
+                            "resolved_key": None,
+                            "reason": sql_escape_reason,
+                        }
+                    )
+
                 resolved_call_name = _call_name(call)
                 if resolved_call_name not in _MUTATOR_KEY_INDEX:
                     resolved_call_name = _resolved_mutator_callable_name(

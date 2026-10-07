@@ -1621,3 +1621,444 @@ def test_repair10_subclass_dispatch(tmp_path: Path) -> None:
             'class C:\n    def choose(self):\n        return "scheduled_run"\n'
             '    def run(self, storage):\n        storage.set_kv(self.choose(), "0")\n' + suffix,
         )
+
+def test_repair11_cross_module_subclass_override_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "base_escape.py").write_text(
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def run(self, storage):\n'
+        '        storage.set_kv(self.choose(), "0")\n',
+        encoding="utf-8",
+    )
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil_subclass.py").write_text(
+        'from app.base_escape import C\n'
+        'class D(C):\n'
+        '    def choose(self):\n'
+        '        return "nav_high_water"\n'
+        'def execute(storage):\n'
+        '    D().run(storage)\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+def test_repair11_cross_module_monkeypatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "base_patch.py").write_text(
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def run(self, storage):\n'
+        '        storage.set_kv(self.choose(), "0")\n',
+        encoding="utf-8",
+    )
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil_patch.py").write_text(
+        'from app.base_patch import C\n'
+        'C.choose = lambda self: "nav_high_water"\n'
+        'def execute(storage):\n'
+        '    C().run(storage)\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            'class C:\n'
+            '    def choose(self):\n'
+            '        return "scheduled_run"\n'
+            '    @staticmethod\n'
+            '    def run(self, storage):\n'
+            '        storage.set_kv(self.choose(), "0")\n'
+        ),
+        (
+            'class C:\n'
+            '    def __getattribute__(self, name):\n'
+            '        if name == "choose":\n'
+            '            return lambda: "nav_high_water"\n'
+            '        return object.__getattribute__(self, name)\n'
+            '    def choose(self):\n'
+            '        return "scheduled_run"\n'
+            '    def run(self, storage):\n'
+            '        storage.set_kv(self.choose(), "0")\n'
+        ),
+        (
+            'class C:\n'
+            '    def choose(self):\n'
+            '        return "scheduled_run"\n'
+            '    def run(self, storage):\n'
+            '        vars(self)["choose"] = lambda: "nav_high_water"\n'
+            '        storage.set_kv(self.choose(), "0")\n'
+        ),
+        (
+            'class C:\n'
+            '    def choose(self):\n'
+            '        return "scheduled_run"\n'
+            '    def run(self, storage):\n'
+            '        self.__dict__["choose"] = lambda: "nav_high_water"\n'
+            '        storage.set_kv(self.choose(), "0")\n'
+        ),
+        (
+            'class C:\n'
+            '    def choose(self):\n'
+            '        return "scheduled_run"\n'
+            '    def run(self, storage, name):\n'
+            '        setattr(self, name, lambda: "nav_high_water")\n'
+            '        storage.set_kv(self.choose(), "0")\n'
+        ),
+    ],
+)
+def test_repair11_receiver_dispatch_uncertainty_fails_closed(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "receiver_escape.py").write_text(source, encoding="utf-8")
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            'class Box:\n'
+            '    pass\n'
+            'def execute(storage, name):\n'
+            '    box = Box()\n'
+            '    box.w = getattr(storage, name)\n'
+            '    box.w("nav_high_water", "0")\n'
+        ),
+        (
+            'def execute(storage, name):\n'
+            '    return getattr(storage, name)\n'
+        ),
+        (
+            'def sink(write):\n'
+            '    return write\n'
+            'def execute(storage, name):\n'
+            '    return sink(getattr(storage, name))\n'
+        ),
+        (
+            'def execute(storage, name):\n'
+            '    write = getattr(storage, name)\n'
+            '    again = write\n'
+            '    again("nav_high_water", "0")\n'
+        ),
+        (
+            'import operator\n'
+            'def execute(storage):\n'
+            '    operator.methodcaller("set_kv", "nav_high_water", "0")(storage)\n'
+        ),
+        (
+            'def execute(storage):\n'
+            '    Storage.__dict__["set_kv"](storage, "nav_high_water", "0")\n'
+        ),
+    ],
+)
+def test_repair11_mutator_capability_escape_fails_closed(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "capability_escape.py").write_text(source, encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["unresolved_kv_mutators"]
+
+
+def test_repair11_raw_sql_kv_write_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "raw_sql_escape.py").write_text(
+        'def execute(conn):\n'
+        '    conn.execute('
+        '"UPDATE kv SET value=\'0\' WHERE key=\'nav_high_water\'")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "raw_sql_kv_write"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair11_dynamic_sql_surface_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "dynamic_sql_escape.py").write_text(
+        'def execute(conn, sql):\n'
+        '    conn.execute(sql)\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "dynamic_sql_mutation_surface"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+def test_repair11_module_constant_monkeypatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "base_mod.py").write_text(
+        'KEY = "scheduled_run"\n'
+        'def run(storage):\n'
+        '    storage.set_kv(KEY, "0")\n',
+        encoding="utf-8",
+    )
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.py").write_text(
+        'import app.base_mod as b\n'
+        'b.KEY = "nav_high_water"\n'
+        'def go(storage):\n'
+        '    b.run(storage)\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["unresolved_kv_mutators"]
+
+
+def test_repair11_module_helper_monkeypatch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "base_mod.py").write_text(
+        'def choose():\n'
+        '    return "scheduled_run"\n'
+        'def run(storage):\n'
+        '    storage.set_kv(choose(), "0")\n',
+        encoding="utf-8",
+    )
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.py").write_text(
+        'import app.base_mod as b\n'
+        'b.choose = lambda: "nav_high_water"\n'
+        'def go(storage):\n'
+        '    b.run(storage)\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+def test_repair11_foreign_receiver_cross_module_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "base_recv.py").write_text(
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def run(self, storage):\n'
+        '        storage.set_kv(self.choose(), "0")\n',
+        encoding="utf-8",
+    )
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.py").write_text(
+        'from app.base_recv import C\n'
+        'class E:\n'
+        '    def choose(self):\n'
+        '        return "nav_high_water"\n'
+        'def go(storage):\n'
+        '    C.run(E(), storage)\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+@pytest.mark.parametrize(
+    "subclass_source",
+    [
+        (
+            'from app.base_alias import C as Parent\n'
+            'class D(Parent):\n'
+            '    def choose(self):\n'
+            '        return "nav_high_water"\n'
+        ),
+        (
+            'from app.base_alias import C\n'
+            'Base = C\n'
+            'class D(Base):\n'
+            '    def choose(self):\n'
+            '        return "nav_high_water"\n'
+        ),
+        (
+            'from app.base_alias import C\n'
+            'D = type("D", (C,), {"choose": lambda self: "nav_high_water"})\n'
+        ),
+    ],
+)
+def test_repair11_aliased_or_dynamic_subclass_fails_closed(
+    tmp_path: Path,
+    subclass_source: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "base_alias.py").write_text(
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def run(self, storage):\n'
+        '        storage.set_kv(self.choose(), "0")\n',
+        encoding="utf-8",
+    )
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.py").write_text(
+        subclass_source
+        + 'def go(storage):\n'
+        + '    D().run(storage)\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            'class Box: pass\n'
+            'def go(st, name):\n'
+            '    box = Box()\n'
+            '    box.w = getattr(st, name)\n'
+            '    box.w("nav_high_water", "0")\n'
+        ),
+        (
+            'def go(st, name):\n'
+            '    return getattr(st, name)\n'
+        ),
+        (
+            'def go(st):\n'
+            '    st.__class__.__dict__["set_kv"]('
+            'st, "nav_high_water", "0")\n'
+        ),
+        (
+            'def go(st):\n'
+            '    type(st).__dict__["set_kv"]('
+            'st, "nav_high_water", "0")\n'
+        ),
+        (
+            'from operator import methodcaller as mc\n'
+            'def go(st):\n'
+            '    mc("set_kv", "nav_high_water", "0")(st)\n'
+        ),
+    ],
+)
+def test_repair11_capability_escape_without_storage_name_fails_closed(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.py").write_text(source, encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "mutator_dynamic_attribute_escape"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+@pytest.mark.parametrize(
+    "source, expected_reason",
+    [
+        (
+            'def go(conn):\n'
+            '    ex = conn.execute\n'
+            '    ex("UPDATE kv SET value=\'0\' '
+            'WHERE key=\'nav_high_water\'")\n',
+            "raw_sql_kv_write",
+        ),
+        (
+            'def go(conn):\n'
+            '    conn.execute("INSERT OR IGNORE INTO main.kv'
+            '(key,value) VALUES(\'nav_high_water\',\'0\')")\n',
+            "raw_sql_kv_write",
+        ),
+        (
+            'def go(conn):\n'
+            '    conn.execute("DROP TABLE [kv]")\n',
+            "raw_sql_kv_write",
+        ),
+        (
+            'from functools import partial\n'
+            'def go(conn):\n'
+            '    run = partial(conn.execute, '
+            '"UPDATE kv SET value=\'0\'")\n'
+            '    run()\n',
+            "sql_callable_escape",
+        ),
+    ],
+)
+def test_repair11_sql_alias_and_variants_fail_closed(
+    tmp_path: Path,
+    source: str,
+    expected_reason: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.py").write_text(source, encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == expected_reason
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            'class C:\n'
+            '    def choose(self):\n'
+            '        return "scheduled_run"\n'
+            'c = C()\n'
+            'c.__dict__["choose"] = lambda: "nav_high_water"\n'
+            'def go(storage):\n'
+            '    storage.set_kv(c.choose(), "0")\n'
+        ),
+        (
+            'class C:\n'
+            '    __getattribute__ = lambda self, name: '
+            '(lambda: "nav_high_water")\n'
+            '    def choose(self):\n'
+            '        return "scheduled_run"\n'
+            '    def run(self, storage):\n'
+            '        storage.set_kv(self.choose(), "0")\n'
+        ),
+    ],
+)
+def test_repair11_additional_lookup_override_shapes_fail_closed(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.py").write_text(source, encoding="utf-8")
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
