@@ -574,6 +574,422 @@ def _sql_mutation_escape_reason(
     )
     return None if allowed_set else "raw_sql_kv_write"
 
+def _whole_tree_parent_map(tree: ast.AST) -> dict[ast.AST, ast.AST]:
+    return {
+        child: parent
+        for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+
+
+def _whole_tree_unique_bindings(tree: ast.AST) -> dict[str, ast.AST]:
+    candidates: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            candidates.setdefault(node.targets[0].id, []).append(node.value)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        ):
+            candidates.setdefault(node.target.id, []).append(node.value)
+    return {
+        name: values[0]
+        for name, values in candidates.items()
+        if len(values) == 1
+    }
+
+
+def _static_string_with_bindings(
+    expression: ast.AST | None,
+    *,
+    bindings: Mapping[str, ast.AST],
+    seen: frozenset[str] = frozenset(),
+) -> str | None:
+    if expression is None:
+        return None
+    direct = _static_string_value(expression)
+    if direct is not None:
+        return direct
+    if isinstance(expression, ast.Name):
+        if expression.id in seen:
+            return None
+        bound = bindings.get(expression.id)
+        if bound is None:
+            return None
+        return _static_string_with_bindings(
+            bound,
+            bindings=bindings,
+            seen=seen | {expression.id},
+        )
+    return None
+
+
+def _lookup_surface_contains_dict_or_vars(expression: ast.AST) -> bool:
+    for node in ast.walk(expression):
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__":
+            return True
+        if isinstance(node, ast.Call) and _call_name(node) in {"vars", "globals"}:
+            return True
+    return False
+
+
+def _resolved_closed_world_sql_callable_name(
+    expression: ast.AST,
+    *,
+    aliases: Mapping[str, str],
+    bindings: Mapping[str, ast.AST],
+) -> str | None:
+    direct = _resolved_sql_callable_name(expression, aliases)
+    if direct is not None:
+        return direct
+    if isinstance(expression, ast.Call):
+        call_name = _call_name(expression)
+        if call_name in {"getattr", "getattribute", "__getattribute__"}:
+            method_lookup = (
+                isinstance(expression.func, ast.Attribute)
+                and call_name in {"getattribute", "__getattribute__"}
+                and len(expression.args) == 1
+            )
+            index = 0 if method_lookup else 1
+            attribute = (
+                expression.args[index]
+                if len(expression.args) > index
+                else next(
+                    (kw.value for kw in expression.keywords if kw.arg == "name"),
+                    None,
+                )
+            )
+            value = _static_string_with_bindings(
+                attribute,
+                bindings=bindings,
+            )
+            if value in _SQL_CALL_NAMES:
+                return value
+        if (
+            call_name == "__getitem__"
+            and isinstance(expression.func, ast.Attribute)
+            and _lookup_surface_contains_dict_or_vars(expression.func.value)
+        ):
+            key = (
+                _static_string_with_bindings(
+                    expression.args[0],
+                    bindings=bindings,
+                )
+                if expression.args
+                else None
+            )
+            if key in _SQL_CALL_NAMES:
+                return key
+    if (
+        isinstance(expression, ast.Subscript)
+        and _lookup_surface_contains_dict_or_vars(expression.value)
+    ):
+        key = _static_string_with_bindings(
+            expression.slice,
+            bindings=bindings,
+        )
+        if key in _SQL_CALL_NAMES:
+            return key
+    return None
+
+
+def _is_allowed_source_commit_subprocess(
+    call: ast.Call,
+    *,
+    relative: str,
+) -> bool:
+    if relative != "app/recovery_authority.py":
+        return False
+    if not (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "subprocess"
+        and call.func.attr == "run"
+        and len(call.args) == 1
+        and isinstance(call.args[0], (ast.List, ast.Tuple))
+    ):
+        return False
+    items = list(call.args[0].elts)
+    if len(items) != 5:
+        return False
+    exact_literals = (
+        isinstance(items[0], ast.Constant) and items[0].value == "git"
+        and isinstance(items[1], ast.Constant) and items[1].value == "-C"
+        and isinstance(items[2], ast.Call)
+        and isinstance(items[2].func, ast.Name)
+        and items[2].func.id == "str"
+        and len(items[2].args) == 1
+        and isinstance(items[2].args[0], ast.Name)
+        and items[2].args[0].id == "repo_root"
+        and isinstance(items[3], ast.Constant)
+        and items[3].value == "rev-parse"
+        and isinstance(items[4], ast.Constant)
+        and items[4].value == "HEAD"
+    )
+    if not exact_literals:
+        return False
+    keywords = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
+    return (
+        isinstance(keywords.get("check"), ast.Constant)
+        and keywords["check"].value is True
+        and isinstance(keywords.get("capture_output"), ast.Constant)
+        and keywords["capture_output"].value is True
+        and isinstance(keywords.get("text"), ast.Constant)
+        and keywords["text"].value is True
+        and isinstance(keywords.get("timeout"), ast.Constant)
+        and keywords["timeout"].value == 5
+    )
+
+
+def _closed_world_escape_rows(
+    tree: ast.Module,
+    *,
+    relative: str,
+) -> list[dict[str, Any]]:
+    bindings = _whole_tree_unique_bindings(tree)
+    parents = _whole_tree_parent_map(tree)
+    sql_aliases: dict[str, str] = {}
+    pending = dict(bindings)
+    while pending:
+        progressed = False
+        for name, expression in list(pending.items()):
+            resolved = _resolved_closed_world_sql_callable_name(
+                expression,
+                aliases=sql_aliases,
+                bindings=bindings,
+            )
+            if resolved is None:
+                continue
+            sql_aliases[name] = resolved
+            del pending[name]
+            progressed = True
+        if not progressed:
+            break
+
+    def scope_name(node: ast.AST) -> str:
+        current = parents.get(node)
+        while current is not None:
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return current.name
+            current = parents.get(current)
+        return "<module>"
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, str]] = set()
+
+    def add(node: ast.AST, call_name: str, reason: str) -> None:
+        identity = (
+            int(getattr(node, "lineno", 0)),
+            int(getattr(node, "col_offset", 0)),
+            reason,
+        )
+        if identity in seen:
+            return
+        seen.add(identity)
+        rows.append(
+            {
+                "path": relative,
+                "line": identity[0],
+                "function": scope_name(node),
+                "call": call_name,
+                "key_status": "unresolved",
+                "resolved_key": None,
+                "reason": reason,
+            }
+        )
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            resolved_sql = _resolved_closed_world_sql_callable_name(
+                node.func,
+                aliases=sql_aliases,
+                bindings=bindings,
+            )
+            if resolved_sql is not None:
+                reason = _sql_mutation_escape_reason(
+                    node,
+                    relative=relative,
+                    scope_name=scope_name(node),
+                    resolved_call_name=resolved_sql,
+                )
+                if reason is not None:
+                    add(node, resolved_sql, reason)
+
+            call_name = _call_name(node)
+            if call_name in {"exec", "eval", "compile", "__import__"}:
+                add(node, call_name, "dynamic_code_execution_surface")
+                continue
+
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "importlib"
+                and node.func.attr in {"import_module", "reload"}
+            ):
+                add(node, f"importlib.{node.func.attr}", "dynamic_code_execution_surface")
+                continue
+
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "subprocess"
+                and node.func.attr
+                in {"run", "Popen", "call", "check_call", "check_output"}
+            ):
+                if not _is_allowed_source_commit_subprocess(
+                    node,
+                    relative=relative,
+                ):
+                    add(
+                        node,
+                        f"subprocess.{node.func.attr}",
+                        "out_of_process_mutation_surface",
+                    )
+                continue
+
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+                and node.func.attr in {"system", "popen", "spawnl", "spawnv"}
+            ):
+                add(
+                    node,
+                    f"os.{node.func.attr}",
+                    "out_of_process_mutation_surface",
+                )
+                continue
+
+            if call_name in {"methodcaller", "attrgetter"}:
+                attribute = (
+                    _static_string_with_bindings(
+                        node.args[0],
+                        bindings=bindings,
+                    )
+                    if node.args
+                    else None
+                )
+                if attribute in _SQL_CALL_NAMES or attribute is None:
+                    add(node, call_name, "sql_callable_escape")
+                if attribute in _MUTATOR_KEY_INDEX or attribute is None:
+                    add(node, call_name, "mutator_dynamic_attribute_escape")
+                continue
+
+            if (
+                call_name == "__getitem__"
+                and isinstance(node.func, ast.Attribute)
+                and _lookup_surface_contains_dict_or_vars(node.func.value)
+            ):
+                key = (
+                    _static_string_with_bindings(
+                        node.args[0],
+                        bindings=bindings,
+                    )
+                    if node.args
+                    else None
+                )
+                if key in _SQL_CALL_NAMES or key is None:
+                    add(node, "__dict__.__getitem__", "sql_callable_escape")
+                if key in _MUTATOR_KEY_INDEX or key is None:
+                    add(
+                        node,
+                        "__dict__.__getitem__",
+                        "mutator_dynamic_attribute_escape",
+                    )
+                continue
+
+            if (
+                call_name == "getitem"
+                and len(node.args) >= 2
+                and _lookup_surface_contains_dict_or_vars(node.args[0])
+            ):
+                key = _static_string_with_bindings(
+                    node.args[1],
+                    bindings=bindings,
+                )
+                if key in _SQL_CALL_NAMES or key is None:
+                    add(node, "getitem", "sql_callable_escape")
+                if key in _MUTATOR_KEY_INDEX or key is None:
+                    add(node, "getitem", "mutator_dynamic_attribute_escape")
+                continue
+
+            if call_name == "reduce" and node.args:
+                first = node.args[0]
+                is_getattr = (
+                    isinstance(first, ast.Name) and first.id == "getattr"
+                ) or (
+                    isinstance(first, ast.Attribute)
+                    and first.attr in {"getattr", "__getattribute__"}
+                )
+                if is_getattr:
+                    constants = {
+                        child.value
+                        for child in ast.walk(node)
+                        if isinstance(child, ast.Constant)
+                        and isinstance(child.value, str)
+                    }
+                    if constants & set(_SQL_CALL_NAMES) or not constants:
+                        add(node, "reduce(getattr)", "sql_callable_escape")
+                    if constants & set(_MUTATOR_KEY_INDEX) or not constants:
+                        add(
+                            node,
+                            "reduce(getattr)",
+                            "mutator_dynamic_attribute_escape",
+                        )
+
+        if (
+            isinstance(node, ast.Subscript)
+            and _lookup_surface_contains_dict_or_vars(node.value)
+        ):
+            key = _static_string_with_bindings(
+                node.slice,
+                bindings=bindings,
+            )
+            if key in _SQL_CALL_NAMES or key is None:
+                add(node, "__dict__/vars", "sql_callable_escape")
+            if key in _MUTATOR_KEY_INDEX or key is None:
+                add(
+                    node,
+                    "__dict__/vars",
+                    "mutator_dynamic_attribute_escape",
+                )
+
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in sql_aliases
+        ):
+            continue
+        parent = parents.get(node)
+        if isinstance(parent, ast.Call) and parent.func is node:
+            continue
+        if (
+            isinstance(parent, (ast.Assign, ast.AnnAssign))
+            and getattr(parent, "value", None) is node
+        ):
+            target = (
+                parent.targets[0]
+                if isinstance(parent, ast.Assign) and len(parent.targets) == 1
+                else parent.target
+                if isinstance(parent, ast.AnnAssign)
+                else None
+            )
+            if (
+                isinstance(target, ast.Name)
+                and sql_aliases.get(target.id) == sql_aliases[node.id]
+            ):
+                continue
+        add(node, sql_aliases[node.id], "sql_callable_escape")
+
+    return rows
+
+
 def _pattern_capture_names(pattern: ast.pattern) -> set[str]:
     names: set[str] = set()
     if isinstance(pattern, ast.MatchAs):
@@ -981,7 +1397,7 @@ def _sql_callable_escape_rows(
 
         def visit(self, node: ast.AST) -> Any:
             parent = self.parents[-1] if self.parents else None
-            if isinstance(node, (ast.Attribute, ast.Call)):
+            if isinstance(node, (ast.Name, ast.Attribute, ast.Call)):
                 references.append((node, parent))
             self.parents.append(node)
             try:
@@ -1026,6 +1442,8 @@ def _sql_callable_escape_rows(
         )
 
     for node, parent in references:
+        if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            continue
         resolved = _resolved_sql_callable_name(node, aliases)
         if resolved is None:
             if (
@@ -1975,6 +2393,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
     repository_constant_candidates: dict[str, set[str]] = {}
     repository_base_names: set[str] = set()
     repository_attribute_unstable: set[str] = set()
+    repository_class_names: set[str] = set()
     repository_class_qualified_names: set[str] = set()
 
     for source_path in sorted(root.rglob("*.py")):
@@ -1990,6 +2409,11 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
 
         repository_attribute_unstable.update(
             _attribute_mutated_names(source_tree)
+        )
+        repository_class_names.update(
+            node.name
+            for node in ast.walk(source_tree)
+            if isinstance(node, ast.ClassDef)
         )
 
         symbols: dict[str, str] = {}
@@ -2071,14 +2495,21 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     repository_class_qualified_names.add(resolved)
 
         for node in ast.walk(source_tree):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.ctx, ast.Load)
-                and isinstance(node.value, ast.Name)
-            ):
-                resolved = symbols.get(node.value.id)
-                if resolved is not None:
-                    repository_class_qualified_names.add(resolved)
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                if node.attr in repository_class_names:
+                    repository_class_qualified_names.add(node.attr)
+                if (
+                    isinstance(node.value, ast.Call)
+                    and _call_name(node.value) == "type"
+                    and len(node.value.args) == 1
+                ):
+                    repository_class_qualified_names.update(
+                        repository_class_names
+                    )
+                if isinstance(node.value, ast.Name):
+                    resolved = symbols.get(node.value.id)
+                    if resolved is not None:
+                        repository_class_qualified_names.add(resolved)
 
     for source_path in sorted(root.rglob("*.py")):
         if not _source_file_is_in_scope(root, source_path):
@@ -2467,6 +2898,12 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             inherited_mutator_aliases={},
             scope_name="<module>",
             owner_class=None,
+        )
+        unresolved_kv_mutators.extend(
+            _closed_world_escape_rows(
+                source_tree,
+                relative=relative,
+            )
         )
 
     for (

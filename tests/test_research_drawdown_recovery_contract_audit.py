@@ -2062,3 +2062,168 @@ def test_repair11_additional_lookup_override_shapes_fail_closed(
     scripts.mkdir()
     (scripts / "evil.py").write_text(source, encoding="utf-8")
     assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+@pytest.mark.parametrize(
+    "source, expected_reason",
+    [
+        (
+            'def go(conn):\n'
+            '    (lambda: conn.execute('
+            '"DELETE FROM kv WHERE key=\\\'nav_high_water\\\'"))()\n',
+            "raw_sql_kv_write",
+        ),
+        (
+            'def sink(f):\n'
+            '    f("DELETE FROM kv WHERE key=\\\'nav_high_water\\\'")\n'
+            'def go(conn):\n'
+            '    ex = conn.execute\n'
+            '    sink(ex)\n',
+            "sql_callable_escape",
+        ),
+        (
+            'def go(conn):\n'
+            '    name = "execute"\n'
+            '    getattr(conn, name)('
+            '"DELETE FROM kv WHERE key=\\\'nav_high_water\\\'")\n',
+            "raw_sql_kv_write",
+        ),
+        (
+            'import operator\n'
+            'def go(conn):\n'
+            '    operator.methodcaller('
+            '"execute", "DELETE FROM kv WHERE key=\\\'nav_high_water\\\'")(conn)\n',
+            "sql_callable_escape",
+        ),
+        (
+            'def go(conn):\n'
+            '    type(conn).__dict__["execute"]('
+            'conn, "DELETE FROM kv WHERE key=\\\'nav_high_water\\\'")\n',
+            "dynamic_sql_mutation_surface",
+        ),
+    ],
+)
+def test_repair12_sql_closed_world_surfaces_fail_closed(
+    tmp_path: Path,
+    source: str,
+    expected_reason: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "escape.py").write_text(source, encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == expected_reason
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair12_module_qualified_foreign_receiver_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "base_recv.py").write_text(
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def run(self, storage):\n'
+        '        storage.set_kv(self.choose(), "0")\n',
+        encoding="utf-8",
+    )
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "escape.py").write_text(
+        'import app.base_recv as m\n'
+        'class E:\n'
+        '    def choose(self):\n'
+        '        return "nav_high_water"\n'
+        'def go(storage):\n'
+        '    m.C.run(E(), storage)\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            'from app.storage import Storage\n'
+            'def go(storage):\n'
+            '    w = Storage.__dict__.__getitem__("set_kv")\n'
+            '    w(storage, "nav_high_water", "0")\n'
+        ),
+        (
+            'from app.storage import Storage\n'
+            'def go(storage):\n'
+            '    w = dict(vars(Storage))["set_kv"]\n'
+            '    w(storage, "nav_high_water", "0")\n'
+        ),
+        (
+            'import operator\n'
+            'from app.storage import Storage\n'
+            'def go(storage):\n'
+            '    w = operator.getitem(vars(Storage), "set_kv")\n'
+            '    w(storage, "nav_high_water", "0")\n'
+        ),
+        (
+            'from functools import reduce\n'
+            'def go(storage):\n'
+            '    w = reduce(getattr, ["set_kv"], storage)\n'
+            '    w("nav_high_water", "0")\n'
+        ),
+    ],
+)
+def test_repair12_mutator_capability_factories_fail_closed(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "escape.py").write_text(source, encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "mutator_dynamic_attribute_escape"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+@pytest.mark.parametrize(
+    "source, expected_reason",
+    [
+        (
+            'def go(storage):\n'
+            '    exec("storage.set_kv(\\\'nav_high_water\\\', \\\'0\\\')")\n',
+            "dynamic_code_execution_surface",
+        ),
+        (
+            'def go(storage):\n'
+            '    eval("storage.set_kv(\\\'nav_high_water\\\', \\\'0\\\')")\n',
+            "dynamic_code_execution_surface",
+        ),
+        (
+            'import subprocess\n'
+            'def go():\n'
+            '    subprocess.run(["sqlite3", "paper.db", '
+            '"DELETE FROM kv WHERE key=\\\'nav_high_water\\\'"])\n',
+            "out_of_process_mutation_surface",
+        ),
+    ],
+)
+def test_repair12_dynamic_execution_surfaces_fail_closed(
+    tmp_path: Path,
+    source: str,
+    expected_reason: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "escape.py").write_text(source, encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == expected_reason
+        for row in result["unresolved_kv_mutators"]
+    )
