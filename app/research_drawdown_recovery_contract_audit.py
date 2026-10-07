@@ -719,8 +719,12 @@ def _is_allowed_source_commit_subprocess(
     call: ast.Call,
     *,
     relative: str,
+    scope_name: str | None = None,
 ) -> bool:
-    if relative != "app/recovery_authority.py":
+    if (
+        relative != "app/recovery_authority.py"
+        or scope_name != "resolve_source_commit"
+    ):
         return False
     if not (
         isinstance(call.func, ast.Attribute)
@@ -844,7 +848,10 @@ def _closed_world_escape_rows(
                     add(node, resolved_sql, reason)
 
             call_name = _call_name(node)
-            if call_name in {"exec", "eval", "compile", "__import__"}:
+            if (
+                isinstance(node.func, ast.Name)
+                and call_name in {"exec", "eval", "compile", "__import__"}
+            ):
                 add(node, call_name, "dynamic_code_execution_surface")
                 continue
 
@@ -867,6 +874,7 @@ def _closed_world_escape_rows(
                 if not _is_allowed_source_commit_subprocess(
                     node,
                     relative=relative,
+                    scope_name=scope_name(node),
                 ):
                     add(
                         node,
@@ -1040,12 +1048,18 @@ _DB_REPLACEMENT_QUALIFIED = {
     "os.rename",
     "os.renames",
     "os.replace",
+    "os.truncate",
+    "os.link",
+    "os.symlink",
     "shutil.copy",
     "shutil.copy2",
     "shutil.copyfile",
+    "shutil.copyfileobj",
+    "shutil.copytree",
+    "shutil.rmtree",
     "shutil.move",
 }
-_PATH_MUTATION_METHODS = {"unlink", "rename", "replace"}
+_PATH_MUTATION_METHODS = {"unlink", "rename", "replace", "write_text", "write_bytes"}
 _SQLITE_REPLACEMENT_METHODS = {"backup", "deserialize"}
 
 
@@ -1058,7 +1072,7 @@ def _authority_python_file_is_in_scope(root: Path, path: Path) -> bool:
 
 def _qualified_bindings(tree: ast.Module) -> dict[str, str]:
     bindings: dict[str, str] = dict(_DYNAMIC_BUILTIN_SYMBOLS)
-    for statement in tree.body:
+    for statement in ast.walk(tree):
         if isinstance(statement, ast.Import):
             for alias in statement.names:
                 local = alias.asname or alias.name.split(".", 1)[0]
@@ -1077,6 +1091,7 @@ def _qualified_bindings(tree: ast.Module) -> dict[str, str]:
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id not in bindings
         ):
             pending.append((node.targets[0].id, node.value))
         elif (
@@ -1137,13 +1152,96 @@ def _literal_strings(node: ast.AST) -> set[str]:
     }
 
 
+def _static_text_expression(
+    expression: ast.AST | None,
+    *,
+    bindings: Mapping[str, ast.AST] | None = None,
+    seen: frozenset[str] = frozenset(),
+) -> str | None:
+    if expression is None:
+        return None
+    if isinstance(expression, ast.Constant):
+        if isinstance(expression.value, str):
+            return expression.value
+        if isinstance(expression.value, (int, float, bool)):
+            return str(expression.value)
+        return None
+    if isinstance(expression, ast.Name) and bindings is not None:
+        if expression.id in seen:
+            return None
+        bound = bindings.get(expression.id)
+        if bound is None:
+            return None
+        return _static_text_expression(
+            bound,
+            bindings=bindings,
+            seen=seen | {expression.id},
+        )
+    if isinstance(expression, ast.JoinedStr):
+        pieces: list[str] = []
+        for value in expression.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                pieces.append(value.value)
+                continue
+            if isinstance(value, ast.FormattedValue):
+                rendered = _static_text_expression(
+                    value.value,
+                    bindings=bindings,
+                    seen=seen,
+                )
+                if rendered is None or value.format_spec is not None:
+                    return None
+                pieces.append(rendered)
+                continue
+            return None
+        return "".join(pieces)
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+        left = _static_text_expression(
+            expression.left,
+            bindings=bindings,
+            seen=seen,
+        )
+        right = _static_text_expression(
+            expression.right,
+            bindings=bindings,
+            seen=seen,
+        )
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
+def _fragment_excludes_governed_keys(
+    fragment: str,
+    *,
+    position: str,
+) -> bool:
+    if not fragment:
+        return False
+    if position == "prefix":
+        return all(
+            not governed.startswith(fragment)
+            for governed in _GOVERNED_RECOVERY_KEYS
+        )
+    if position == "suffix":
+        return all(
+            not governed.endswith(fragment)
+            for governed in _GOVERNED_RECOVERY_KEYS
+        )
+    raise ValueError(f"unsupported fragment position: {position}")
+
+
 def _recovery_key_value(
     expression: ast.AST,
     *,
     bindings: Mapping[str, ast.AST],
     seen: frozenset[str] = frozenset(),
 ) -> str | None:
-    direct = _static_string_value(expression)
+    direct = _static_text_expression(
+        expression,
+        bindings=bindings,
+        seen=seen,
+    )
     if direct in _GOVERNED_RECOVERY_KEYS:
         return direct
     if isinstance(expression, ast.Name):
@@ -1310,6 +1408,41 @@ def _storage_set_helper_issue(
     return None
 
 
+def _recovery_writer_identity_issue(
+    tree: ast.Module,
+    *,
+    relative: str,
+) -> dict[str, Any] | None:
+    if relative != "app/storage.py":
+        return None
+    storage_classes = [
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "Storage"
+    ]
+    methods = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_evaluate_recovery_locked"
+    ]
+    if (
+        len(storage_classes) == 1
+        and len(methods) == 1
+        and isinstance(methods[0], ast.FunctionDef)
+        and methods[0] in storage_classes[0].body
+    ):
+        return None
+    node = methods[0] if methods else None
+    return {
+        "path": relative,
+        "line": int(getattr(node, "lineno", 0)) if node is not None else 0,
+        "function": "_evaluate_recovery_locked",
+        "call": "recovery_writer",
+        "key_status": "unresolved",
+        "resolved_key": None,
+        "reason": "recovery_authority_identity_ambiguous",
+    }
+
+
 def _lexical_scope_nodes(tree: ast.Module) -> list[ast.AST]:
     return [
         tree,
@@ -1443,6 +1576,27 @@ def _repair13_authority_escape_rows(
     helper_issue = _storage_set_helper_issue(tree, relative=relative)
     if helper_issue is not None:
         rows.append(helper_issue)
+    recovery_issue = _recovery_writer_identity_issue(tree, relative=relative)
+    if recovery_issue is not None:
+        rows.append(recovery_issue)
+
+    if relative == "app/storage.py":
+        for candidate in ast.walk(tree):
+            if isinstance(candidate, ast.Assign):
+                if any(
+                    isinstance(target, ast.Name) and target.id == "state"
+                    for target in candidate.targets
+                ):
+                    if _call_name(candidate.value) not in {
+                        "active_state",
+                        "latched_state",
+                        "parse_recovery_state",
+                    }:
+                        add(
+                            candidate,
+                            "recovery_writer",
+                            "recovery_state_value_provenance_ambiguous",
+                        )
 
     def inherited_sql_aliases(node: ast.AST) -> set[str]:
         result: set[str] = set()
@@ -1459,8 +1613,17 @@ def _repair13_authority_escape_rows(
             isinstance(node, ast.Assign)
             and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Call)
-            and _qualified_symbol(node.value.func, qualified) == "pathlib.Path"
+            and (
+                (
+                    isinstance(node.value, ast.Call)
+                    and _qualified_symbol(node.value.func, qualified)
+                    == "pathlib.Path"
+                )
+                or any(
+                    "adaptive_paper.sqlite3" in text.casefold()
+                    for text in _literal_strings(node.value)
+                )
+            )
         ):
             path_names.add(node.targets[0].id)
 
@@ -1478,6 +1641,8 @@ def _repair13_authority_escape_rows(
                 node.args[key_index],
                 bindings=expression_bindings,
             )
+            if relative == _AUDIT_SOURCE_PATH and key in _GOVERNED_RECOVERY_KEYS:
+                add(node, call_name, "audit_module_mutation_surface")
             if key in {_RECOVERY_STATE_KEY, _RECOVERY_INITIALIZED_KEY} and not (
                 _is_exact_recovery_authority_write(
                     node,
@@ -1527,6 +1692,7 @@ def _repair13_authority_escape_rows(
                 and _is_allowed_source_commit_subprocess(
                     node,
                     relative=relative,
+                    scope_name=identity(node)[0],
                 )
             ):
                 add(
@@ -1724,11 +1890,22 @@ def _repository_foreign_dispatch_rows(root: Path) -> list[dict[str, Any]]:
 
     for relative, tree in parsed:
         parents = _whole_tree_parent_map(tree)
+        class_bindings: dict[str, set[str]] = {}
+        for binding_node in ast.walk(tree):
+            if (
+                isinstance(binding_node, ast.Assign)
+                and len(binding_node.targets) == 1
+                and isinstance(binding_node.targets[0], ast.Name)
+            ):
+                resolved = called_class(binding_node.value)
+                if resolved is not None:
+                    class_bindings.setdefault(binding_node.targets[0].id, set()).add(resolved)
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
                 owner = class_reference(node.func.value)
                 if owner is not None and node.args:
-                    receiver = called_class(node.args[0])
+                    receiver = called_class(node.args[0]) or (next(iter(class_bindings.get(node.args[0].id, set()))) if isinstance(node.args[0], ast.Name) and len(class_bindings.get(node.args[0].id, set())) == 1 else None)
                     if receiver is not None and receiver != owner:
                         marker = (
                             relative,
@@ -1780,7 +1957,7 @@ def _repository_foreign_dispatch_rows(root: Path) -> list[dict[str, Any]]:
 
 def _repository_script_escape_rows(root: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    executable_suffixes = {".ps1", ".cmd", ".bat", ".pyw", ".pth"}
+    executable_suffixes = {".ps1", ".psm1", ".cmd", ".bat", ".sh", ".pyw", ".pth"}
     mutation_pattern = re.compile(
         r"(?i)"
         r"(?:(?<![\w.])sqlite3(?:\.exe)?\b|"
@@ -1811,6 +1988,56 @@ def _repository_script_escape_rows(root: Path) -> list[dict[str, Any]]:
         except OSError:
             continue
         lines = text.splitlines()
+        direct_authority_line = next(
+            (
+                index + 1
+                for index, line in enumerate(lines)
+                if authority_pattern.search(line)
+                and not re.match(
+                    r"(?i)^\s*\$env:DB_PATH\s*=",
+                    line,
+                )
+            ),
+            None,
+        )
+        if direct_authority_line is not None:
+            rows.append({
+                "path": relative_path.as_posix(),
+                "line": direct_authority_line,
+                "function": "<script>",
+                "call": path.suffix.casefold(),
+                "key_status": "unresolved",
+                "resolved_key": None,
+                "reason": "non_python_recovery_mutation_surface",
+            })
+            continue
+        authority_vars: set[str] = set()
+        for line in lines:
+            match = re.match(
+                r"(?i)^\s*\$(?!env:)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$",
+                line,
+            )
+            if match and authority_pattern.search(match.group(2)):
+                authority_vars.add(match.group(1))
+        for name in authority_vars:
+            uses = [
+                index + 1
+                for index, line in enumerate(lines)
+                if re.search("(?i)\\$" + re.escape(name) + r"\b", line)
+            ]
+            if len(uses) > 1:
+                rows.append({
+                    "path": relative_path.as_posix(),
+                    "line": uses[1],
+                    "function": "<script>",
+                    "call": path.suffix.casefold(),
+                    "key_status": "unresolved",
+                    "resolved_key": None,
+                    "reason": "non_python_recovery_mutation_surface",
+                })
+                break
+        if rows and rows[-1]["path"] == relative_path.as_posix():
+            continue
         for index in range(len(lines)):
             window = "\n".join(lines[index : index + 3])
             if not (
@@ -2957,6 +3184,13 @@ def _resolve_key_expression(
         )
 
     if isinstance(expression, ast.JoinedStr):
+        static_joined = _static_text_expression(
+            expression,
+            bindings=bindings,
+            seen=seen_names,
+        )
+        if static_joined is not None:
+            return "exact", static_joined
         prefix = ""
         suffix = ""
         before_dynamic = True
@@ -2975,9 +3209,9 @@ def _resolve_key_expression(
         suffix = "".join(after_dynamic_parts)
         if not has_dynamic:
             return "exact", prefix
-        if prefix and not _NAV_HIGH_WATER_KEY.startswith(prefix):
+        if prefix and _fragment_excludes_governed_keys(prefix, position="prefix"):
             return "safe_non_target", prefix
-        if suffix and not _NAV_HIGH_WATER_KEY.endswith(suffix):
+        if suffix and _fragment_excludes_governed_keys(suffix, position="suffix"):
             return "safe_non_target", suffix
         return "unresolved", None
 
@@ -3000,9 +3234,9 @@ def _resolve_key_expression(
         )
         if left_status == right_status == "exact":
             return "exact", f"{left_value}{right_value}"
-        if left_status == "exact" and left_value and not _NAV_HIGH_WATER_KEY.startswith(left_value):
+        if left_status == "exact" and left_value and _fragment_excludes_governed_keys(left_value, position="prefix"):
             return "safe_non_target", left_value
-        if right_status == "exact" and right_value and not _NAV_HIGH_WATER_KEY.endswith(right_value):
+        if right_status == "exact" and right_value and _fragment_excludes_governed_keys(right_value, position="suffix"):
             return "safe_non_target", right_value
         if left_status == "safe_non_target" or right_status == "safe_non_target":
             return "safe_non_target", None
@@ -3073,8 +3307,6 @@ def _resolve_key_expression(
 
 def _source_file_is_in_scope(root: Path, path: Path) -> bool:
     relative = path.relative_to(root)
-    if relative.as_posix() == _AUDIT_SOURCE_PATH:
-        return False
     if any(part in _EXCLUDED_SOURCE_PARTS for part in relative.parts):
         return False
     return not (relative.parts and relative.parts[0] == "tests")

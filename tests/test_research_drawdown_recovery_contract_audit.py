@@ -2477,3 +2477,207 @@ def test_repair13_legitimate_powershell_db_reference_is_allowed(
         encoding="utf-8",
     )
     assert audit.audit_production_source_contract(repo)["contract_ok"] is True
+
+
+def test_repair14_constructed_recovery_key_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "constructed.py").write_text(
+        'from app.recovery_authority import active_state, canonical_json\n'
+        'def go(storage):\n'
+        '    key = f"drawdown_recovery_state_{chr(118)}1"\n'
+        '    storage.set_kv(key, canonical_json(active_state()))\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+def test_repair14_active_rewrite_in_authority_method_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    path = repo / "app" / "storage.py"
+    text = path.read_text(encoding="utf-8")
+    needle = "            state = parse_recovery_state(raw_state)\n"
+    replacement = needle + "            state = dict(state, state=STATE_ACTIVE)\n"
+    assert needle in text
+    path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "recovery_state_value_provenance_ambiguous"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+
+
+def test_repair14_foreign_receiver_variable_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "base_recv.py").write_text(
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def run(self, storage):\n'
+        '        storage.set_kv(self.choose(), "0")\n',
+        encoding="utf-8",
+    )
+    (repo / "app" / "_evil.py").write_text(
+        'import app.base_recv as m\n'
+        'class E:\n'
+        '    def choose(self):\n'
+        '        return "nav_high_water"\n'
+        'def go(storage):\n'
+        '    e = E()\n'
+        '    m.C.run(e, storage)\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+
+
+
+
+def test_repair14_audit_module_direct_write_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    target = repo / "app" / "research_drawdown_recovery_contract_audit.py"
+    target.write_text(
+        Path(audit.__file__).read_text(encoding="utf-8")
+        + '\n\ndef extra_writer(storage):\n'
+        + '    storage.set_kv("nav_high_water", "0")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "audit_module_mutation_surface"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair14_script_variable_db_reuse_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "rewrite.ps1").write_text(
+        '$db = "data/adaptive_paper.sqlite3"\n'
+        '# gap\n# gap\n# gap\n# gap\n'
+        'Invoke-DbReplacement $db\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "non_python_recovery_mutation_surface"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair14_duplicate_async_recovery_method_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    path = repo / "app" / "storage.py"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + '\nclass Other:\n'
+        + '    async def _evaluate_recovery_locked(self, nav):\n'
+        + '        return nav\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "recovery_authority_identity_ambiguous"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair14_composed_governed_db_path_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "path_case.py").write_text(
+        'from pathlib import Path\n'
+        'def go():\n'
+        '    db = Path("data") / "adaptive_paper.sqlite3"\n'
+        '    db.unlink()\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "governed_db_replacement_surface"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair14_function_local_import_is_resolved_without_execution() -> None:
+    tree = ast.Module(
+        body=[
+            ast.FunctionDef(
+                name="go",
+                args=ast.arguments(
+                    posonlyargs=[],
+                    args=[],
+                    kwonlyargs=[],
+                    kw_defaults=[],
+                    defaults=[],
+                ),
+                body=[
+                    ast.Import(
+                        names=[ast.alias(name="subprocess", asname="sp")]
+                    )
+                ],
+                decorator_list=[],
+            )
+        ],
+        type_ignores=[],
+    )
+    bindings = audit._qualified_bindings(tree)
+    assert bindings["sp"] == "subprocess"
+    symbol = audit._qualified_symbol(
+        ast.Attribute(
+            value=ast.Name(id="sp", ctx=ast.Load()),
+            attr="run",
+            ctx=ast.Load(),
+        ),
+        bindings,
+    )
+    assert symbol == "subprocess.run"
+
+
+def test_repair14_import_alias_is_not_hidden_by_unrelated_shadow() -> None:
+    tree = ast.Module(
+        body=[
+            ast.Import(names=[ast.alias(name="subprocess", asname="sp")]),
+            ast.Import(names=[ast.alias(name="os", asname=None)]),
+            ast.FunctionDef(
+                name="noise",
+                args=ast.arguments(
+                    posonlyargs=[],
+                    args=[],
+                    kwonlyargs=[],
+                    kw_defaults=[],
+                    defaults=[],
+                ),
+                body=[
+                    ast.Assign(
+                        targets=[ast.Name(id="sp", ctx=ast.Store())],
+                        value=ast.Attribute(
+                            value=ast.Name(id="os", ctx=ast.Load()),
+                            attr="path",
+                            ctx=ast.Load(),
+                        ),
+                    )
+                ],
+                decorator_list=[],
+            ),
+        ],
+        type_ignores=[],
+    )
+    bindings = audit._qualified_bindings(tree)
+    assert bindings["sp"] == "subprocess"
