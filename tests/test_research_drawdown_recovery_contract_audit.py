@@ -1559,3 +1559,65 @@ def test_write_report_is_deterministic(tmp_path: Path) -> None:
     audit.write_report(payload, jb, mb)
     assert ja.read_bytes() == jb.read_bytes()
     assert ma.read_bytes() == mb.read_bytes()
+
+
+def test_repair10_capability_escapes(tmp_path: Path) -> None:
+    cases = {
+        "class_alias": 'class Box:\n    write = storage.set_kv\nBox.write("nav_high_water", "0")\n',
+        "unknown_lookup": 'write = getattr(storage, name)\nwrite("nav_high_water", "0")\n',
+        "getattr": 'write = getattr(storage, "set_kv")\nwrite("nav_high_water", "0")\n',
+        "getattribute": 'write = storage.__getattribute__("delete_kv")\nwrite("nav_high_water")\n',
+        "dynamic_lookup": 'name = "set_kv"\nwrite = getattr(storage, name)\nwrite("nav_high_water", "0")\n',
+    }
+    for name, source in cases.items():
+        case_root = tmp_path / name
+        case_root.mkdir()
+        repo = write_repo(case_root)
+        _repair9_assert_contract_false(repo, "scripts/escape.py", source)
+
+
+def test_repair10_cross_module_mutator_export(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    donor = repo / "app" / "donor.py"
+    donor.write_text("write = Storage.set_kv\n", encoding="utf-8")
+    _repair9_assert_contract_false(
+        repo, "scripts/imported.py",
+        'from app.donor import write\nwrite("nav_high_water", "0")\n',
+    )
+
+
+def test_repair10_method_receiver_frames(tmp_path: Path) -> None:
+    cases = {
+        "rebound": '    def run(self, storage):\n        self = other\n        storage.set_kv(self.choose(), "0")\n',
+        "nested": '    def run(self, storage):\n        def invoke(self):\n            storage.set_kv(self.choose(), "0")\n        invoke(other)\n',
+        "unrelated_cls": '    def run(self, cls, storage):\n        storage.set_kv(cls.choose(), "0")\n',
+        "unrelated_self": '    def run(cls, self, storage):\n        storage.set_kv(self.choose(), "0")\n',
+        "nonlocal": '    def run(self, storage):\n        def replace():\n            nonlocal self\n            self = other\n        storage.set_kv(self.choose(), "0")\n',
+        "global": '    def run(self, storage):\n        global self\n        self = other\n        storage.set_kv(self.choose(), "0")\n',
+    }
+    for name, body in cases.items():
+        case_root = tmp_path / name
+        case_root.mkdir()
+        repo = write_repo(case_root)
+        _repair9_assert_contract_false(
+            repo, "scripts/receiver.py",
+            'class C:\n    def choose(self):\n        return "scheduled_run"\n' + body,
+        )
+
+
+def test_repair10_subclass_dispatch(tmp_path: Path) -> None:
+    cases = {
+        "alias_base": 'Base = C\nAlias = Base\nclass D(Alias):\n    choose = lambda self: "nav_high_water"\n',
+        "decorated": 'def replace(cls):\n    cls.choose = lambda self: "nav_high_water"\n    return cls\n@replace\nclass D(C):\n    pass\n',
+        "decorated_replacement": 'def replace(cls):\n    return type("Replacement", (C,), {"choose": lambda self: "nav_high_water"})\n@replace\nclass D(C):\n    pass\n',
+        "metaclass": 'class Meta(type):\n    def __new__(meta, name, bases, ns):\n        ns["choose"] = lambda self: "nav_high_water"\n        return type.__new__(meta, name, bases, ns)\nclass D(C, metaclass=Meta):\n    pass\n',
+    }
+    for name, suffix in cases.items():
+        case_root = tmp_path / name
+        case_root.mkdir()
+        repo = write_repo(case_root)
+        _repair9_assert_contract_false(
+            repo, "scripts/dispatch.py",
+            'class C:\n    def choose(self):\n        return "scheduled_run"\n'
+            '    def run(self, storage):\n        storage.set_kv(self.choose(), "0")\n' + suffix,
+        )

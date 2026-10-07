@@ -809,6 +809,8 @@ def _mutator_callable_escape_rows(
     binding_counts: Mapping[str, int],
     relative: str,
     scope_name: str,
+    allow_local_aliases: bool = False,
+    bindings: Mapping[str, ast.AST] | None = None,
 ) -> list[dict[str, Any]]:
     references: list[tuple[ast.AST, ast.AST | None]] = []
     imports: list[ast.ImportFrom] = []
@@ -819,7 +821,7 @@ def _mutator_callable_escape_rows(
 
         def visit(self, node: ast.AST) -> Any:
             parent = self.parents[-1] if self.parents else None
-            if isinstance(node, (ast.Name, ast.Attribute)):
+            if isinstance(node, (ast.Name, ast.Attribute, ast.Call)):
                 references.append((node, parent))
             if isinstance(node, ast.ImportFrom):
                 imports.append(node)
@@ -886,7 +888,42 @@ def _mutator_callable_escape_rows(
                     "mutator_callable_import_escape",
                 )
 
+    invoked_names = {
+        call.func.id
+        for statement in statements
+        for call in ast.walk(statement)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
     for node, parent in references:
+        if isinstance(node, ast.Call):
+            # Lookup hooks and descriptor semantics are not modeled.
+            if _call_name(node) in {"getattr", "getattribute", "__getattribute__"}:
+                index = (
+                    0 if isinstance(node.func, ast.Attribute)
+                    and _call_name(node) in {"getattribute", "__getattribute__"}
+                    and len(node.args) == 1 else 1
+                )
+                attribute = node.args[index] if len(node.args) > index else next(
+                    (kw.value for kw in node.keywords if kw.arg == "name"), None
+                )
+                status, key = _resolve_key_expression(
+                    attribute, bindings=bindings or {}, helper_returns={}
+                )
+                assigned_names = (
+                    set().union(*(
+                        _assignment_target_names(target) for target in parent.targets
+                    )) if isinstance(parent, ast.Assign) else
+                    _assignment_target_names(parent.target)
+                    if isinstance(parent, ast.AnnAssign) else set()
+                )
+                callable_use = (
+                    isinstance(parent, ast.Call) and parent.func is node
+                ) or bool(assigned_names & invoked_names)
+                if (status == "exact" and key in _MUTATOR_KEY_INDEX) or (
+                    status != "exact" and callable_use
+                ):
+                    add(node, _call_name(node), "mutator_dynamic_attribute_escape")
+            continue
         if isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
             continue
         resolved = _resolved_mutator_callable_name(node, aliases)
@@ -895,7 +932,8 @@ def _mutator_callable_escape_rows(
         if isinstance(parent, ast.Call) and parent.func is node:
             continue
         if (
-            isinstance(parent, ast.Assign)
+            allow_local_aliases
+            and isinstance(parent, ast.Assign)
             and parent.value is node
             and len(parent.targets) == 1
             and isinstance(parent.targets[0], ast.Name)
@@ -903,7 +941,8 @@ def _mutator_callable_escape_rows(
         ):
             continue
         if (
-            isinstance(parent, ast.AnnAssign)
+            allow_local_aliases
+            and isinstance(parent, ast.AnnAssign)
             and parent.value is node
             and isinstance(parent.target, ast.Name)
             and binding_counts.get(parent.target.id) == 1
@@ -1012,15 +1051,59 @@ def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
             collector.visit(statement)
         return values
 
+    module_facts = _scope_binding_facts(tree)
+    classes = {
+        statement.name: statement for statement in tree.body
+        if isinstance(statement, ast.ClassDef)
+    }
+    class_aliases = {
+        name: name for name in classes
+        if module_facts["binding_counts"].get(name) == 1
+        and name not in _global_declared_names(tree)
+    }
+    pending = {
+        name: value for name, value in module_facts["unique_bindings"].items()
+        if name not in _global_declared_names(tree)
+    }
+    while pending:
+        progressed = False
+        for name, value in list(pending.items()):
+            if isinstance(value, ast.Name) and value.id in class_aliases:
+                class_aliases[name] = class_aliases[value.id]
+                del pending[name]
+                progressed = True
+        if not progressed:
+            break
+
     subclass_overrides: set[tuple[str, str]] = set()
-    for statement in tree.body:
-        if not isinstance(statement, ast.ClassDef):
-            continue
-        override_names = _scope_bound_names(statement)
+    unsafe_dispatch: set[str] = set()
+    bases_by_class: dict[str, set[str]] = {}
+    for name, statement in classes.items():
+        bases: set[str] = set()
         for base in statement.bases:
-            if isinstance(base, ast.Name):
-                for name in override_names:
-                    subclass_overrides.add((base.id, name))
+            resolved = class_aliases.get(base.id) if isinstance(base, ast.Name) else None
+            if resolved is None:
+                # Unknown bases can hide a subclass relationship.
+                unsafe_dispatch.update(classes)
+            else:
+                bases.add(resolved)
+        bases_by_class[name] = bases
+        if statement.decorator_list or statement.keywords:
+            unsafe_dispatch.add(name)
+
+    for name, statement in classes.items():
+        ancestors = set(bases_by_class[name])
+        pending_bases = list(ancestors)
+        while pending_bases:
+            for base in bases_by_class.get(pending_bases.pop(), set()):
+                if base not in ancestors:
+                    ancestors.add(base)
+                    pending_bases.append(base)
+        for base in ancestors:
+            for method in _scope_bound_names(statement):
+                subclass_overrides.add((base, method))
+        if name in unsafe_dispatch:
+            unsafe_dispatch.update(ancestors)
 
     def add_helper(
         function: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -1044,6 +1127,15 @@ def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
             return
         params = tuple(arg.arg for arg in (*args.posonlyargs, *args.args))
 
+        receiver = params[0] if params else None
+        receiver_facts = _scope_binding_facts(function)
+        if kind == "method" and (
+            receiver not in {"self", "cls"}
+            or receiver_facts["binding_counts"].get(receiver) != 1
+            or receiver in _descendant_nonlocal_names(function)
+            or receiver in _global_declared_names(tree)
+        ):
+            return
         local_bound_names = _scope_bound_names(function)
         if any(
             isinstance(call.func, ast.Name)
@@ -1059,6 +1151,7 @@ def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
                 "params": params,
                 "kind": kind,
                 "owner": owner,
+                "receiver": receiver,
             }
         )
 
@@ -1074,7 +1167,7 @@ def _helper_return_expressions(tree: ast.Module) -> dict[str, dict[str, Any]]:
             ):
                 add_helper(statement, kind="module")
         elif isinstance(statement, ast.ClassDef):
-            if statement.decorator_list:
+            if statement.name in unsafe_dispatch:
                 continue
             class_facts = _scope_binding_facts(statement)
             for child in statement.body:
@@ -1103,7 +1196,7 @@ def _resolve_key_expression(
     helper_returns: Mapping[str, Mapping[str, Any]],
     seen_names: frozenset[str] = frozenset(),
     seen_helpers: frozenset[str] = frozenset(),
-    method_owner: str | None = None,
+    method_owner: tuple[str, str] | None = None,
 ) -> tuple[str, str | None]:
     if isinstance(expression, ast.Constant) and isinstance(expression.value, str):
         return "exact", expression.value
@@ -1200,9 +1293,8 @@ def _resolve_key_expression(
             if (
                 kind != "method"
                 or not isinstance(expression.func.value, ast.Name)
-                or expression.func.value.id not in {"self", "cls"}
+                or method_owner != (helper_owner, expression.func.value.id)
                 or helper_owner is None
-                or method_owner != helper_owner
             ):
                 return "unresolved", None
             if params and params[0] in {"self", "cls"}:
@@ -1231,7 +1323,7 @@ def _resolve_key_expression(
             seen_names=seen_names,
             seen_helpers=seen_helpers | {helper_name},
             method_owner=(
-                str(helper.get("owner"))
+                (str(helper["owner"]), str(helper["receiver"]))
                 if kind == "method" and helper.get("owner") is not None
                 else None
             ),
@@ -1485,7 +1577,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
         bindings: Mapping[str, ast.AST],
         helper_returns: Mapping[str, ast.AST],
         resolved_call_name: str | None = None,
-        method_owner: str | None = None,
+        method_owner: tuple[str, str] | None = None,
     ) -> None:
         call_name = resolved_call_name or _call_name(call)
         key_index = _MUTATOR_KEY_INDEX.get(call_name)
@@ -1574,6 +1666,19 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             owner_class: str | None,
         ) -> None:
             facts = _scope_binding_facts(scope_node)
+            method_identity = None
+            if owner_class is not None and isinstance(
+                scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                positional = [*scope_node.args.posonlyargs, *scope_node.args.args]
+                receiver = positional[0].arg if positional else None
+                if (
+                    receiver in {"self", "cls"}
+                    and facts["binding_counts"].get(receiver) == 1
+                    and receiver not in _descendant_nonlocal_names(scope_node)
+                    and receiver not in module_global_unstable_names
+                ):
+                    method_identity = (owner_class, receiver)
             descendant_nonlocal_names = (
                 _descendant_nonlocal_names(scope_node)
                 if isinstance(
@@ -1633,9 +1738,13 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                 _mutator_callable_escape_rows(
                     statements,
                     aliases=scope_mutator_aliases,
+                    bindings=scope_bindings,
                     binding_counts=facts["binding_counts"],
                     relative=relative,
                     scope_name=scope_name,
+                    allow_local_aliases=isinstance(
+                        scope_node, (ast.FunctionDef, ast.AsyncFunctionDef)
+                    ),
                 )
             )
 
@@ -1685,7 +1794,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     bindings=scope_bindings,
                     helper_returns=scope_helper_returns,
                     resolved_call_name=resolved_call_name,
-                    method_owner=owner_class,
+                    method_owner=method_identity,
                 )
 
             for child_scope in _nested_scope_nodes(statements):
@@ -1704,7 +1813,7 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                     child_owner = (
                         scope_node.name
                         if isinstance(scope_node, ast.ClassDef)
-                        else owner_class
+                        else None
                     )
                 else:
                     child_name = f"<class:{child_scope.name}>"
