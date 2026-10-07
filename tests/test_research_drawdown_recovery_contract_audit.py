@@ -272,6 +272,13 @@ def storage_source(
 from .recovery_authority import RECOVERY_STATE_KEY
 
 class Storage:
+    @staticmethod
+    def _set_kv_conn(conn, key, value):
+        conn.execute(
+            "INSERT OR REPLACE INTO kv(key, value) VALUES(?,?)",
+            (key, value),
+        )
+
     def update_nav_high_water_atomic(self, nav: float):
         nav_value = float(nav)
         with self._recovery_conn() as conn:
@@ -2227,3 +2234,246 @@ def test_repair12_dynamic_execution_surfaces_fail_closed(
         row["reason"] == expected_reason
         for row in result["unresolved_kv_mutators"]
     )
+def test_repair13_recovery_state_clear_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "state_clear.py").write_text(
+        'from app.recovery_authority import RECOVERY_STATE_KEY, active_state, canonical_json\n'
+        'def apply(storage):\n'
+        '    storage.set_kv(RECOVERY_STATE_KEY, canonical_json(active_state()))\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "ungoverned_recovery_authority_write"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair13_subprocess_alias_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "spawn_escape.py").write_text(
+        'import subprocess as sp\n'
+        'def apply():\n'
+        '    sp.run(["sqlite3", "data/adaptive_paper.sqlite3", '
+        '"DELETE FROM kv WHERE key=\\\'nav_high_water\\\'"])\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "out_of_process_mutation_surface"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair13_governed_db_unlink_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "db_replace.py").write_text(
+        'from pathlib import Path\n'
+        'def apply():\n'
+        '    Path("data/adaptive_paper.sqlite3").unlink()\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "governed_db_replacement_surface"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair13_source_commit_subprocess_kwargs_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    path = repo / "app" / "recovery_authority.py"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + '\nimport subprocess\n'
+        + 'def source_commit_escape(repo_root, extra):\n'
+        + '    return subprocess.run(["git", "-C", str(repo_root), "rev-parse", "HEAD"], '
+        + 'check=True, capture_output=True, text=True, timeout=5, **extra)\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "out_of_process_mutation_surface"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair13_duplicate_storage_set_helper_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    path = repo / "app" / "storage.py"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + '\nclass OtherWriter:\n'
+        + '    @staticmethod\n'
+        + '    def _set_kv_conn(conn, key, value):\n'
+        + '        conn.execute("INSERT OR REPLACE INTO kv(key, value) VALUES(?,?)", '
+        + '("nav_high_water", "0"))\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "storage_set_helper_identity_ambiguous"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair13_reused_sql_alias_in_lambda_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "alias_lambda.py").write_text(
+        'def first(conn):\n'
+        '    ex = conn.execute\n'
+        '    ex("SELECT 1")\n'
+        'def go(conn):\n'
+        '    ex = conn.execute\n'
+        '    (lambda: ex("DELETE FROM kv WHERE key=\\\'nav_high_water\\\'"))()\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "raw_sql_kv_write"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair13_file_order_foreign_receiver_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    (repo / "app" / "base_recv.py").write_text(
+        'class C:\n'
+        '    def choose(self):\n'
+        '        return "scheduled_run"\n'
+        '    def run(self, storage):\n'
+        '        storage.set_kv(self.choose(), "0")\n',
+        encoding="utf-8",
+    )
+    (repo / "app" / "_evil.py").write_text(
+        'import app.base_recv as m\n'
+        'class E:\n'
+        '    def choose(self):\n'
+        '        return "nav_high_water"\n'
+        'def go(storage):\n'
+        '    m.C.run(E(), storage)\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            'from app.storage import Storage\n'
+            'def go(storage):\n'
+            '    w = dict(vars(Storage)).get("set_kv")\n'
+            '    w(storage, "nav_high_water", "0")\n'
+        ),
+        (
+            'from app.storage import Storage\n'
+            'def go(storage):\n'
+            '    w = next(v for k, v in vars(Storage).items() if k == "set_kv")\n'
+            '    w(storage, "nav_high_water", "0")\n'
+        ),
+        (
+            'import inspect\n'
+            'def go(conn):\n'
+            '    inspect.getattr_static(type(conn), "execute")('
+            'conn, "DELETE FROM kv WHERE key=\\\'nav_high_water\\\'")\n'
+        ),
+    ],
+)
+def test_repair13_reflection_capability_factories_fail_closed(
+    tmp_path: Path,
+    source: str,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "reflect.py").write_text(source, encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["unresolved_kv_mutators"]
+
+
+def test_repair13_dynamic_getattr_call_on_conn_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "dynamic_call.py").write_text(
+        'def go(conn, name, sql):\n'
+        '    getattr(conn, name).__call__(sql)\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "dynamic_persistent_capability_call"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair13_nested_app_tests_path_is_in_scope(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    nested = repo / "app" / "tests"
+    nested.mkdir()
+    (nested / "reset.py").write_text(
+        'def go(storage):\n'
+        '    storage.set_kv("nav_high_water", "0")\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+def test_repair13_powershell_sqlite_mutation_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "evil.ps1").write_text(
+        'sqlite3.exe "data/adaptive_paper.sqlite3" '
+        '"DELETE FROM kv WHERE key=''nav_high_water''"\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(
+        row["reason"] == "non_python_recovery_mutation_surface"
+        for row in result["unresolved_kv_mutators"]
+    )
+
+
+def test_repair13_legitimate_powershell_db_reference_is_allowed(
+    tmp_path: Path,
+) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "run.ps1").write_text(
+        '$env:DB_PATH = "data/adaptive_paper.sqlite3"\n'
+        '& $pythonPath $runnerPath\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is True

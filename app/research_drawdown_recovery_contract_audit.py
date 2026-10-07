@@ -359,6 +359,13 @@ def _module_constant(tree: ast.Module, name: str) -> Any:
 
 
 _NAV_HIGH_WATER_KEY = "nav_high_water"
+_RECOVERY_STATE_KEY = "drawdown_recovery_state_v1"
+_RECOVERY_INITIALIZED_KEY = "drawdown_recovery_initialized_v1"
+_GOVERNED_RECOVERY_KEYS = {
+    _NAV_HIGH_WATER_KEY,
+    _RECOVERY_STATE_KEY,
+    _RECOVERY_INITIALIZED_KEY,
+}
 _MUTATOR_KEY_INDEX = {
     "set_kv": 0,
     "delete_kv": 0,
@@ -371,7 +378,6 @@ _EXCLUDED_SOURCE_PARTS = {
     ".venv",
     "__pycache__",
     ".pytest_cache",
-    "tests",
 }
 _AUDIT_SOURCE_PATH = "app/research_drawdown_recovery_contract_audit.py"
 
@@ -561,10 +567,21 @@ def _sql_mutation_escape_reason(
     if not (mentions_kv and mutates_schema_or_rows):
         return None
 
+    exact_set_params = bool(
+        len(call.args) == 2
+        and not call.keywords
+        and isinstance(call.args[1], (ast.Tuple, ast.List))
+        and len(call.args[1].elts) == 2
+        and isinstance(call.args[1].elts[0], ast.Name)
+        and call.args[1].elts[0].id == "key"
+        and isinstance(call.args[1].elts[1], ast.Name)
+        and call.args[1].elts[1].id == "value"
+    )
     allowed_set = bool(
         call_name == "execute"
         and relative == "app/storage.py"
         and scope_name == "_set_kv_conn"
+        and exact_set_params
         and re.fullmatch(
             r"insert\s+or\s+replace\s+into\s+kv\s*"
             r"\(\s*key\s*,\s*value\s*\)\s*"
@@ -733,7 +750,13 @@ def _is_allowed_source_commit_subprocess(
     )
     if not exact_literals:
         return False
-    keywords = {kw.arg: kw.value for kw in call.keywords if kw.arg is not None}
+    if len(call.keywords) != 4 or any(
+        keyword.arg is None for keyword in call.keywords
+    ):
+        return False
+    keywords = {kw.arg: kw.value for kw in call.keywords}
+    if set(keywords) != {"check", "capture_output", "text", "timeout"}:
+        return False
     return (
         isinstance(keywords.get("check"), ast.Constant)
         and keywords["check"].value is True
@@ -987,6 +1010,826 @@ def _closed_world_escape_rows(
                 continue
         add(node, sql_aliases[node.id], "sql_callable_escape")
 
+    return rows
+
+
+_DYNAMIC_BUILTIN_SYMBOLS = {
+    "exec": "builtins.exec",
+    "eval": "builtins.eval",
+    "compile": "builtins.compile",
+    "__import__": "builtins.__import__",
+}
+_PROCESS_MODULES = {"subprocess", "os", "asyncio"}
+_PROCESS_LEAF_NAMES = {
+    "run",
+    "Popen",
+    "call",
+    "check_call",
+    "check_output",
+    "getoutput",
+    "getstatusoutput",
+    "system",
+    "popen",
+    "startfile",
+    "create_subprocess_exec",
+    "create_subprocess_shell",
+}
+_DB_REPLACEMENT_QUALIFIED = {
+    "os.remove",
+    "os.unlink",
+    "os.rename",
+    "os.renames",
+    "os.replace",
+    "shutil.copy",
+    "shutil.copy2",
+    "shutil.copyfile",
+    "shutil.move",
+}
+_PATH_MUTATION_METHODS = {"unlink", "rename", "replace"}
+_SQLITE_REPLACEMENT_METHODS = {"backup", "deserialize"}
+
+
+def _authority_python_file_is_in_scope(root: Path, path: Path) -> bool:
+    relative = path.relative_to(root)
+    if any(part in _EXCLUDED_SOURCE_PARTS for part in relative.parts):
+        return False
+    return not (relative.parts and relative.parts[0] == "tests")
+
+
+def _qualified_bindings(tree: ast.Module) -> dict[str, str]:
+    bindings: dict[str, str] = dict(_DYNAMIC_BUILTIN_SYMBOLS)
+    for statement in tree.body:
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                local = alias.asname or alias.name.split(".", 1)[0]
+                bindings[local] = alias.name
+        elif isinstance(statement, ast.ImportFrom) and statement.module:
+            for alias in statement.names:
+                if alias.name == "*":
+                    continue
+                bindings[alias.asname or alias.name] = (
+                    f"{statement.module}.{alias.name}"
+                )
+
+    pending: list[tuple[str, ast.AST]] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            pending.append((node.targets[0].id, node.value))
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        ):
+            pending.append((node.target.id, node.value))
+
+    while pending:
+        progressed = False
+        remaining: list[tuple[str, ast.AST]] = []
+        for name, expression in pending:
+            resolved = _qualified_symbol(expression, bindings)
+            if resolved is None:
+                remaining.append((name, expression))
+                continue
+            bindings[name] = resolved
+            progressed = True
+        pending = remaining
+        if not progressed:
+            break
+    return bindings
+
+
+def _qualified_symbol(
+    expression: ast.AST,
+    bindings: Mapping[str, str],
+) -> str | None:
+    if isinstance(expression, ast.Name):
+        return bindings.get(expression.id)
+    if isinstance(expression, ast.Attribute):
+        base = _qualified_symbol(expression.value, bindings)
+        if base is None:
+            return None
+        return f"{base}.{expression.attr}"
+    if isinstance(expression, ast.Call):
+        callee = _qualified_symbol(expression.func, bindings)
+        if callee in {"builtins.getattr", "getattr"} or _call_name(expression) == "getattr":
+            if len(expression.args) < 2:
+                return None
+            base = _qualified_symbol(expression.args[0], bindings)
+            attribute = _static_string_value(expression.args[1])
+            if base is not None and attribute is not None:
+                return f"{base}.{attribute}"
+        if callee == "pathlib.Path" or (
+            isinstance(expression.func, ast.Name) and expression.func.id == "Path"
+        ):
+            return "pathlib.Path()"
+    return None
+
+
+def _literal_strings(node: ast.AST) -> set[str]:
+    return {
+        child.value
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, str)
+    }
+
+
+def _recovery_key_value(
+    expression: ast.AST,
+    *,
+    bindings: Mapping[str, ast.AST],
+    seen: frozenset[str] = frozenset(),
+) -> str | None:
+    direct = _static_string_value(expression)
+    if direct in _GOVERNED_RECOVERY_KEYS:
+        return direct
+    if isinstance(expression, ast.Name):
+        named = {
+            "RECOVERY_STATE_KEY": _RECOVERY_STATE_KEY,
+            "RECOVERY_INITIALIZED_KEY": _RECOVERY_INITIALIZED_KEY,
+        }.get(expression.id)
+        if named is not None:
+            return named
+        if expression.id in seen:
+            return None
+        bound = bindings.get(expression.id)
+        if bound is not None:
+            return _recovery_key_value(
+                bound,
+                bindings=bindings,
+                seen=seen | {expression.id},
+            )
+    return None
+
+
+def _enclosing_function_and_class(
+    node: ast.AST,
+    parents: Mapping[ast.AST, ast.AST],
+) -> tuple[str | None, str | None]:
+    function_name: str | None = None
+    class_name: str | None = None
+    current = parents.get(node)
+    while current is not None:
+        if (
+            function_name is None
+            and isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            function_name = current.name
+        if class_name is None and isinstance(current, ast.ClassDef):
+            class_name = current.name
+        current = parents.get(current)
+    return function_name, class_name
+
+
+def _is_exact_recovery_authority_write(
+    call: ast.Call,
+    *,
+    relative: str,
+    parents: Mapping[ast.AST, ast.AST],
+    key: str,
+) -> bool:
+    function_name, class_name = _enclosing_function_and_class(call, parents)
+    if not (
+        relative == "app/storage.py"
+        and class_name == "Storage"
+        and function_name == "_evaluate_recovery_locked"
+        and _call_name(call) == "_set_kv_conn"
+        and len(call.args) == 3
+        and not call.keywords
+    ):
+        return False
+    value = call.args[2]
+    if key == _RECOVERY_STATE_KEY:
+        return bool(
+            isinstance(value, ast.Call)
+            and _call_name(value) == "canonical_json"
+            and len(value.args) == 1
+            and isinstance(value.args[0], ast.Name)
+            and value.args[0].id in {"state", "latched"}
+            and not value.keywords
+        )
+    if key == _RECOVERY_INITIALIZED_KEY:
+        return isinstance(value, ast.Name) and value.id == "RECOVERY_INITIALIZED_VALUE"
+    return False
+
+
+def _storage_set_helper_issue(
+    tree: ast.Module,
+    *,
+    relative: str,
+) -> dict[str, Any] | None:
+    if relative != "app/storage.py":
+        return None
+    parents = _whole_tree_parent_map(tree)
+    definitions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_set_kv_conn"
+    ]
+    if len(definitions) != 1:
+        return {
+            "path": relative,
+            "line": 0,
+            "function": "_set_kv_conn",
+            "call": "execute",
+            "key_status": "unresolved",
+            "resolved_key": None,
+            "reason": "storage_set_helper_identity_ambiguous",
+        }
+    fn = definitions[0]
+    parent = parents.get(fn)
+    positional = [*fn.args.posonlyargs, *fn.args.args]
+    if not (
+        isinstance(parent, ast.ClassDef)
+        and parent.name == "Storage"
+        and [arg.arg for arg in positional] == ["conn", "key", "value"]
+        and fn.args.vararg is None
+        and fn.args.kwarg is None
+        and not fn.args.kwonlyargs
+        and len(fn.decorator_list) == 1
+        and isinstance(fn.decorator_list[0], ast.Name)
+        and fn.decorator_list[0].id == "staticmethod"
+        and len(fn.body) == 1
+        and isinstance(fn.body[0], ast.Expr)
+        and isinstance(fn.body[0].value, ast.Call)
+    ):
+        line = int(getattr(fn, "lineno", 0))
+        return {
+            "path": relative,
+            "line": line,
+            "function": "_set_kv_conn",
+            "call": "execute",
+            "key_status": "unresolved",
+            "resolved_key": None,
+            "reason": "storage_set_helper_identity_ambiguous",
+        }
+    call = fn.body[0].value
+    if not (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id == "conn"
+        and call.func.attr == "execute"
+        and len(call.args) == 2
+        and not call.keywords
+        and isinstance(call.args[1], (ast.Tuple, ast.List))
+        and len(call.args[1].elts) == 2
+        and isinstance(call.args[1].elts[0], ast.Name)
+        and call.args[1].elts[0].id == "key"
+        and isinstance(call.args[1].elts[1], ast.Name)
+        and call.args[1].elts[1].id == "value"
+    ):
+        return {
+            "path": relative,
+            "line": int(getattr(call, "lineno", 0)),
+            "function": "_set_kv_conn",
+            "call": "execute",
+            "key_status": "unresolved",
+            "resolved_key": None,
+            "reason": "storage_set_helper_identity_ambiguous",
+        }
+    sql_text = _static_string_value(call.args[0])
+    if sql_text is None or not re.fullmatch(
+        r"insert\s+or\s+replace\s+into\s+kv\s*"
+        r"\(\s*key\s*,\s*value\s*\)\s*"
+        r"values\s*\(\s*\?\s*,\s*\?\s*\)\s*;?",
+        _normalized_sql(sql_text),
+    ):
+        return {
+            "path": relative,
+            "line": int(getattr(call, "lineno", 0)),
+            "function": "_set_kv_conn",
+            "call": "execute",
+            "key_status": "unresolved",
+            "resolved_key": None,
+            "reason": "storage_set_helper_identity_ambiguous",
+        }
+    return None
+
+
+def _lexical_scope_nodes(tree: ast.Module) -> list[ast.AST]:
+    return [
+        tree,
+        *[
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
+        ],
+    ]
+
+
+def _direct_scope_sql_aliases(
+    scope: ast.AST,
+    *,
+    qualified: Mapping[str, str],
+) -> set[str]:
+    aliases: set[str] = set()
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is scope:
+                self.generic_visit(node)
+                return
+            for default in node.args.defaults:
+                self.visit(default)
+            for default in node.args.kw_defaults:
+                if default is not None:
+                    self.visit(default)
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            if node is scope:
+                self.generic_visit(node)
+                return
+            for default in node.args.defaults:
+                self.visit(default)
+            for default in node.args.kw_defaults:
+                if default is not None:
+                    self.visit(default)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            if node is scope:
+                self.generic_visit(node)
+                return
+            for base in node.bases:
+                self.visit(base)
+            for keyword in node.keywords:
+                self.visit(keyword.value)
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+
+        def _assignment(self, target: ast.AST, value: ast.AST) -> None:
+            if not isinstance(target, ast.Name):
+                return
+            resolved = _qualified_symbol(value, qualified)
+            if (
+                isinstance(value, ast.Attribute)
+                and value.attr in _SQL_CALL_NAMES
+            ) or (
+                resolved is not None
+                and resolved.rsplit(".", 1)[-1] in _SQL_CALL_NAMES
+            ):
+                aliases.add(target.id)
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if len(node.targets) == 1:
+                self._assignment(node.targets[0], node.value)
+            self.visit(node.value)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if node.value is not None:
+                self._assignment(node.target, node.value)
+                self.visit(node.value)
+
+    visitor = Visitor()
+    if isinstance(scope, ast.Module):
+        for statement in scope.body:
+            visitor.visit(statement)
+    elif isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        for statement in scope.body:
+            visitor.visit(statement)
+    elif isinstance(scope, ast.Lambda):
+        visitor.visit(scope.body)
+    return aliases
+
+
+def _repair13_authority_escape_rows(
+    tree: ast.Module,
+    *,
+    relative: str,
+) -> list[dict[str, Any]]:
+    parents = _whole_tree_parent_map(tree)
+    expression_bindings = _whole_tree_unique_bindings(tree)
+    qualified = _qualified_bindings(tree)
+    scope_aliases = {
+        scope: _direct_scope_sql_aliases(scope, qualified=qualified)
+        for scope in _lexical_scope_nodes(tree)
+    }
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, str]] = set()
+
+    def identity(node: ast.AST) -> tuple[str, str]:
+        function_name, class_name = _enclosing_function_and_class(node, parents)
+        return function_name or "<module>", class_name or ""
+
+    def add(node: ast.AST, call_name: str, reason: str) -> None:
+        marker = (
+            int(getattr(node, "lineno", 0)),
+            int(getattr(node, "col_offset", 0)),
+            reason,
+        )
+        if marker in seen:
+            return
+        seen.add(marker)
+        function_name, _class_name = identity(node)
+        rows.append(
+            {
+                "path": relative,
+                "line": marker[0],
+                "function": function_name,
+                "call": call_name,
+                "key_status": "unresolved",
+                "resolved_key": None,
+                "reason": reason,
+            }
+        )
+
+    helper_issue = _storage_set_helper_issue(tree, relative=relative)
+    if helper_issue is not None:
+        rows.append(helper_issue)
+
+    def inherited_sql_aliases(node: ast.AST) -> set[str]:
+        result: set[str] = set()
+        current: ast.AST | None = node
+        while current is not None:
+            if current in scope_aliases:
+                result.update(scope_aliases[current])
+            current = parents.get(current)
+        return result
+
+    path_names: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, ast.Call)
+            and _qualified_symbol(node.value.func, qualified) == "pathlib.Path"
+        ):
+            path_names.add(node.targets[0].id)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        call_name = _call_name(node)
+        qualified_call = _qualified_symbol(node.func, qualified)
+        strings = _literal_strings(node)
+
+        key_index = _MUTATOR_KEY_INDEX.get(call_name)
+        if key_index is not None and len(node.args) > key_index:
+            key = _recovery_key_value(
+                node.args[key_index],
+                bindings=expression_bindings,
+            )
+            if key in {_RECOVERY_STATE_KEY, _RECOVERY_INITIALIZED_KEY} and not (
+                _is_exact_recovery_authority_write(
+                    node,
+                    relative=relative,
+                    parents=parents,
+                    key=key,
+                )
+            ):
+                add(
+                    node,
+                    call_name,
+                    "ungoverned_recovery_authority_write",
+                )
+
+        if (
+            qualified_call in {
+                "builtins.exec",
+                "builtins.eval",
+                "builtins.compile",
+                "builtins.__import__",
+            }
+            or (
+                qualified_call is not None
+                and qualified_call
+                in {"importlib.import_module", "importlib.reload"}
+            )
+        ):
+            add(node, qualified_call or call_name, "dynamic_code_execution_surface")
+
+        if qualified_call is not None:
+            process_surface = (
+                qualified_call.startswith("subprocess.")
+                or qualified_call
+                in {
+                    "os.system",
+                    "os.popen",
+                    "os.startfile",
+                    "asyncio.create_subprocess_exec",
+                    "asyncio.create_subprocess_shell",
+                }
+                or qualified_call.startswith("os.exec")
+                or qualified_call.startswith("os.spawn")
+                or qualified_call.startswith("os.posix_spawn")
+            )
+            if process_surface and not (
+                qualified_call == "subprocess.run"
+                and _is_allowed_source_commit_subprocess(
+                    node,
+                    relative=relative,
+                )
+            ):
+                add(
+                    node,
+                    qualified_call,
+                    "out_of_process_mutation_surface",
+                )
+
+            if qualified_call in _DB_REPLACEMENT_QUALIFIED:
+                add(
+                    node,
+                    qualified_call,
+                    "governed_db_replacement_surface",
+                )
+
+        if isinstance(node.func, ast.Attribute):
+            if node.func.attr in _PATH_MUTATION_METHODS:
+                receiver = node.func.value
+                receiver_is_path = bool(
+                    (
+                        isinstance(receiver, ast.Call)
+                        and _qualified_symbol(receiver.func, qualified)
+                        == "pathlib.Path"
+                    )
+                    or (
+                        isinstance(receiver, ast.Name)
+                        and receiver.id in path_names
+                    )
+                )
+                receiver_text = ast.unparse(receiver).casefold()
+                if receiver_is_path and (
+                    "adaptive_paper" in receiver_text
+                    or "db" in receiver_text
+                    or node.func.attr == "unlink"
+                ):
+                    add(
+                        node,
+                        f"Path.{node.func.attr}",
+                        "governed_db_replacement_surface",
+                    )
+            if node.func.attr in _SQLITE_REPLACEMENT_METHODS:
+                add(
+                    node,
+                    node.func.attr,
+                    "governed_db_replacement_surface",
+                )
+
+        aliases = inherited_sql_aliases(node)
+        if isinstance(node.func, ast.Name) and node.func.id in aliases:
+            reason = _sql_mutation_escape_reason(
+                node,
+                relative=relative,
+                scope_name=identity(node)[0],
+                resolved_call_name="execute",
+            )
+            if reason is not None:
+                add(node, "execute", reason)
+
+        risky_literals = (
+            strings
+            & (
+                set(_MUTATOR_KEY_INDEX)
+                | set(_SQL_CALL_NAMES)
+                | _GOVERNED_RECOVERY_KEYS
+            )
+        )
+        if call_name in {
+            "get",
+            "getitem",
+            "__getitem__",
+            "next",
+            "reduce",
+            "getattr_static",
+            "attrgetter",
+            "methodcaller",
+        } and risky_literals:
+            if risky_literals & set(_SQL_CALL_NAMES):
+                add(node, call_name, "sql_callable_escape")
+            if risky_literals & (
+                set(_MUTATOR_KEY_INDEX) | _GOVERNED_RECOVERY_KEYS
+            ):
+                add(
+                    node,
+                    call_name,
+                    "mutator_dynamic_attribute_escape",
+                )
+
+        if (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr == "__call__"
+            and isinstance(node.func.value, ast.Call)
+            and _call_name(node.func.value)
+            in {"getattr", "getattribute", "__getattribute__", "getattr_static"}
+        ):
+            target = (
+                node.func.value.args[0]
+                if node.func.value.args
+                else None
+            )
+            target_name = (
+                target.id.casefold()
+                if isinstance(target, ast.Name)
+                else ast.unparse(target).casefold()
+                if target is not None
+                else ""
+            )
+            attribute = (
+                _static_string_value(node.func.value.args[1])
+                if len(node.func.value.args) > 1
+                else None
+            )
+            if (
+                attribute in _SQL_CALL_NAMES
+                or attribute in _MUTATOR_KEY_INDEX
+                or attribute is None
+                and any(
+                    token in target_name
+                    for token in ("conn", "db", "storage", "store")
+                )
+            ):
+                add(
+                    node,
+                    "__call__",
+                    "dynamic_persistent_capability_call",
+                )
+
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+        ):
+            continue
+        aliases = inherited_sql_aliases(node)
+        if node.id not in aliases:
+            continue
+        parent = parents.get(node)
+        if isinstance(parent, ast.Call) and parent.func is node:
+            continue
+        if isinstance(parent, ast.Attribute) and parent.value is node:
+            continue
+        if (
+            isinstance(parent, (ast.Assign, ast.AnnAssign))
+            and getattr(parent, "value", None) is node
+        ):
+            continue
+        add(node, "sql_callable", "sql_callable_escape")
+
+    return rows
+
+
+def _repository_foreign_dispatch_rows(root: Path) -> list[dict[str, Any]]:
+    parsed: list[tuple[str, ast.Module]] = []
+    class_names: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        if not _authority_python_file_is_in_scope(root, path):
+            continue
+        relative = path.relative_to(root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parsed.append((relative, tree))
+        class_names.update(
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef)
+        )
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int, int]] = set()
+
+    def class_reference(expression: ast.AST) -> str | None:
+        if isinstance(expression, ast.Name) and expression.id in class_names:
+            return expression.id
+        if (
+            isinstance(expression, ast.Attribute)
+            and expression.attr in class_names
+        ):
+            return expression.attr
+        if isinstance(expression, ast.Call) and _call_name(expression) == "getattr":
+            if len(expression.args) >= 2:
+                name = _static_string_value(expression.args[1])
+                if name in class_names:
+                    return name
+        if (
+            isinstance(expression, ast.Subscript)
+            and _lookup_surface_contains_dict_or_vars(expression.value)
+        ):
+            name = _static_string_value(expression.slice)
+            if name in class_names:
+                return name
+        return None
+
+    def called_class(expression: ast.AST) -> str | None:
+        if not isinstance(expression, ast.Call):
+            return None
+        return class_reference(expression.func)
+
+    for relative, tree in parsed:
+        parents = _whole_tree_parent_map(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                owner = class_reference(node.func.value)
+                if owner is not None and node.args:
+                    receiver = called_class(node.args[0])
+                    if receiver is not None and receiver != owner:
+                        marker = (
+                            relative,
+                            int(getattr(node, "lineno", 0)),
+                            int(getattr(node, "col_offset", 0)),
+                        )
+                        if marker not in seen:
+                            seen.add(marker)
+                            function_name, _ = _enclosing_function_and_class(
+                                node, parents
+                            )
+                            rows.append(
+                                {
+                                    "path": relative,
+                                    "line": marker[1],
+                                    "function": function_name or "<module>",
+                                    "call": node.func.attr,
+                                    "key_status": "unresolved",
+                                    "resolved_key": None,
+                                    "reason": "foreign_receiver_dispatch_uncertainty",
+                                }
+                            )
+            if isinstance(node, ast.ClassDef):
+                for base in node.bases:
+                    owner = class_reference(base)
+                    if owner is not None and not (
+                        isinstance(base, ast.Name) and base.id == owner
+                    ):
+                        marker = (
+                            relative,
+                            int(getattr(base, "lineno", 0)),
+                            int(getattr(base, "col_offset", 0)),
+                        )
+                        if marker not in seen:
+                            seen.add(marker)
+                            rows.append(
+                                {
+                                    "path": relative,
+                                    "line": marker[1],
+                                    "function": f"<class:{node.name}>",
+                                    "call": "dynamic_class_base",
+                                    "key_status": "unresolved",
+                                    "resolved_key": None,
+                                    "reason": "foreign_receiver_dispatch_uncertainty",
+                                }
+                            )
+    return rows
+
+
+def _repository_script_escape_rows(root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    executable_suffixes = {".ps1", ".cmd", ".bat", ".pyw", ".pth"}
+    mutation_pattern = re.compile(
+        r"(?i)"
+        r"(?:(?<![\w.])sqlite3(?:\.exe)?\b|"
+        r"\bremove-item\b|\bmove-item\b|\bcopy-item\b|"
+        r"\bdel\s+|\berase\s+|"
+        r"\bos\.(?:remove|unlink|replace|rename)\b|"
+        r"\bpath(?:lib)?[^\r\n]*\.(?:unlink|replace|rename)\b|"
+        r"\bshutil\.(?:copy|copy2|copyfile|move)\b|"
+        r"\bdelete\s+from\s+kv\b|"
+        r"\bupdate\s+kv\b|"
+        r"\binsert\s+(?:or\s+replace\s+)?into\s+kv\b)"
+    )
+    authority_pattern = re.compile(
+        r"(?i)"
+        r"(?:adaptive_paper\.sqlite3|nav_high_water|"
+        r"drawdown_recovery_state_v1|drawdown_recovery_initialized_v1)"
+    )
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.casefold() not in executable_suffixes:
+            continue
+        relative_path = path.relative_to(root)
+        if any(part in _EXCLUDED_SOURCE_PARTS for part in relative_path.parts):
+            continue
+        if relative_path.parts and relative_path.parts[0] == "tests":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        lines = text.splitlines()
+        for index in range(len(lines)):
+            window = "\n".join(lines[index : index + 3])
+            if not (
+                mutation_pattern.search(window)
+                and authority_pattern.search(window)
+            ):
+                continue
+            rows.append(
+                {
+                    "path": relative_path.as_posix(),
+                    "line": index + 1,
+                    "function": "<script>",
+                    "call": path.suffix.casefold(),
+                    "key_status": "unresolved",
+                    "resolved_key": None,
+                    "reason": "non_python_recovery_mutation_surface",
+                }
+            )
+            break
     return rows
 
 
@@ -2232,7 +3075,9 @@ def _source_file_is_in_scope(root: Path, path: Path) -> bool:
     relative = path.relative_to(root)
     if relative.as_posix() == _AUDIT_SOURCE_PATH:
         return False
-    return not any(part in _EXCLUDED_SOURCE_PARTS for part in relative.parts)
+    if any(part in _EXCLUDED_SOURCE_PARTS for part in relative.parts):
+        return False
+    return not (relative.parts and relative.parts[0] == "tests")
 
 
 def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
@@ -2645,6 +3490,38 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             nav_high_water_calls.append(row)
             writer_calls.append(row)
             return
+        if status == "exact" and resolved_key in {
+            _RECOVERY_STATE_KEY,
+            _RECOVERY_INITIALIZED_KEY,
+        }:
+            parents = _whole_tree_parent_map(
+                next(
+                    source_tree
+                    for (
+                        _source_path,
+                        source_relative,
+                        _source_text,
+                        source_tree,
+                        _module_bindings,
+                        _helper_returns,
+                    ) in source_modules
+                    if source_relative == relative
+                )
+            )
+            if _is_exact_recovery_authority_write(
+                call,
+                relative=relative,
+                parents=parents,
+                key=resolved_key,
+            ):
+                return
+            unresolved_kv_mutators.append(
+                {
+                    **row,
+                    "reason": "ungoverned_recovery_authority_write",
+                }
+            )
+            return
         if status in {"exact", "safe_non_target"}:
             return
 
@@ -2905,6 +3782,28 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
                 relative=relative,
             )
         )
+
+    # Repair13 authority-surface guard intentionally includes the audit module
+    # itself and production-reachable nested paths such as app/tests.
+    for authority_path in sorted(root.rglob("*.py")):
+        if not _authority_python_file_is_in_scope(root, authority_path):
+            continue
+        authority_text = authority_path.read_text(encoding="utf-8")
+        try:
+            authority_tree = ast.parse(authority_text)
+        except SyntaxError as exc:
+            raise RuntimeError(
+                f"cannot parse authority surface: {authority_path}: {exc}"
+            ) from exc
+        authority_relative = authority_path.relative_to(root).as_posix()
+        unresolved_kv_mutators.extend(
+            _repair13_authority_escape_rows(
+                authority_tree,
+                relative=authority_relative,
+            )
+        )
+    unresolved_kv_mutators.extend(_repository_foreign_dispatch_rows(root))
+    unresolved_kv_mutators.extend(_repository_script_escape_rows(root))
 
     for (
         _source_path,
