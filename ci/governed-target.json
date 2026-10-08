@@ -2,7 +2,7 @@
   "schema_version": 1,
   "repository": "oishi1216/trend_bot",
   "pr_number": 23,
-  "target_sha": "2da70d5089732a13b76574d1250300f49809ceca",
+  "target_sha": "bbbf7f98190a78ed731f84f5fe34b5dc639cb56a",
   "expected_base_sha": "0e3aa1882bdc26ee10e5114c6bc760505f46879c",
   "status_context": "governed-ci/trend-bot"
 }
