@@ -1488,7 +1488,59 @@ def _repair15_writer_value_rows(
             _RECOVERY_INITIALIZED_KEY: 2,
         },
     }
-    for method in storage_classes[0].body:
+    methods_by_name: dict[str, list[ast.FunctionDef]] = {
+        name: [
+            node for node in storage_classes[0].body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        ]
+        for name in trusted
+    }
+    helper_defs = [
+        node for node in storage_classes[0].body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_set_kv_conn"
+    ]
+    helper_ok = len(helper_defs) == 1 and isinstance(helper_defs[0], ast.FunctionDef)
+    if helper_ok:
+        helper = helper_defs[0]
+        helper_ok = (
+            len(helper.decorator_list) == 1
+            and isinstance(helper.decorator_list[0], ast.Name)
+            and helper.decorator_list[0].id == "staticmethod"
+            and [a.arg for a in helper.args.args] == ["conn", "key", "value"]
+            and len(helper.body) == 1
+            and sum(1 for n in ast.walk(helper) if isinstance(n, ast.Call)) == 1
+            and sum(1 for n in ast.walk(helper) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id == "conn" and n.func.attr == "execute") == 1
+        )
+    for method_name in trusted:
+        candidates = methods_by_name[method_name]
+        if len(candidates) != 1 or not helper_ok:
+            report(candidates[0] if candidates else storage_classes[0], method_name,
+                   "writer_value_identity_ambiguous")
+            continue
+        method = candidates[0]
+        if (method.decorator_list or isinstance(method, ast.AsyncFunctionDef)
+                or method.args.vararg or method.args.kwarg):
+            report(method, method_name, "writer_value_identity_ambiguous")
+        # Bind every local name in source order. Callable aliases and direct
+        # connection methods are not accepted as proof of the approved writer.
+        for node in ast.walk(method):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in {"getattr", "setattr", "exec", "eval"}:
+                    report(node, method_name, "writer_callable_identity_unproven")
+                if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name) and node.func.value.id == "conn" and node.func.attr in {"execute", "executemany", "executescript"}:
+                    if not (node.func.attr == "execute" and node.args and isinstance(node.args[0], ast.Constant)
+                            and isinstance(node.args[0].value, str) and not re.search(r"(?i)\b(?:insert|update|delete|replace)\s+(?:or\s+\w+\s+)?(?:into|kv)", node.args[0].value)):
+                        report(node, method_name, "writer_raw_sql_mutation_unproven")
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name) and node.value.value.id == "self" and node.value.attr == "_set_kv_conn":
+                report(node, method_name, "writer_callable_alias_unproven")
+            if isinstance(node, ast.Assign) and isinstance(node.value, ast.Attribute) and isinstance(node.value.value, ast.Name) and node.value.value.id == "conn" and node.value.attr in {"execute", "executemany", "executescript"}:
+                report(node, method_name, "writer_callable_alias_unproven")
+        if any(isinstance(n, ast.Nonlocal) or isinstance(n, ast.Global) for n in ast.walk(method)):
+            report(method, method_name, "writer_value_identity_ambiguous")
         if not isinstance(method, ast.FunctionDef) or method.name not in trusted:
             continue
         observed: dict[str, int] = {}
@@ -1553,14 +1605,33 @@ def _repair15_writer_value_rows(
             observed[key] = observed.get(key, 0) + 1
             # The write must occur in an approved branch's *body*, not just
             # somewhere inside the trusted function or the branch's else arm.
-            body_conditions: list[str] = []
+            body_conditions: list[ast.expr] = []
             cursor: ast.AST = node
             while cursor in parents:
                 ancestor = parents[cursor]
-                if isinstance(ancestor, ast.If) and cursor in ancestor.body:
-                    body_conditions.append(ast.unparse(ancestor.test))
+                if isinstance(ancestor, ast.If):
+                    if cursor in ancestor.body:
+                        body_conditions.append(ancestor.test)
+                    elif cursor in ancestor.orelse:
+                        body_conditions.append(ast.UnaryOp(op=ast.Not(), operand=ancestor.test))
                 cursor = ancestor
-            branch_text = " ".join(body_conditions)
+            def conjuncts(test: ast.expr) -> list[ast.expr]:
+                if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+                    return [part for value in test.values for part in conjuncts(value)]
+                return [test]
+
+            def has_guard(test: ast.expr, predicate: str) -> bool:
+                wanted = predicate.replace(" ", "")
+                candidates = conjuncts(test)
+                # An enclosing AND preserves each positive fact. Negated or OR
+                # predicates do not establish the required transition guard.
+                return any(ast.unparse(part).replace(" ", "") == wanted for part in candidates)
+
+            def path_has(predicate: str) -> bool:
+                return any(
+                    has_guard(condition, predicate)
+                    for condition in body_conditions
+                )
             if method.name == "update_nav_high_water_atomic":
                 minimal_atomic_max = (
                     not any(isinstance(candidate, ast.If) for candidate in ast.walk(method))
@@ -1580,22 +1651,19 @@ def _repair15_writer_value_rows(
                     )
                 )
                 proven_branch = key == _NAV_HIGH_WATER_KEY and (
-                    "raw is None" in branch_text
-                    or "high_water != current" in branch_text
+                    path_has("raw is None")
+                    or path_has("high_water != current")
                     or minimal_atomic_max
                 )
             elif key == _NAV_HIGH_WATER_KEY:
-                proven_branch = (
-                    "raw_state is None" in branch_text
-                    or "nav_value > high_water" in branch_text
-                )
+                proven_branch = path_has("raw_state is None") or path_has("nav_value > high_water")
             elif key == _RECOVERY_STATE_KEY:
-                proven_branch = (
-                    "raw_state is None" in branch_text
-                    or "recovery_latch_reached(" in branch_text
-                )
+                proven_branch = path_has("raw_state is None") or (
+                    path_has("state['state'] == STATE_ACTIVE")
+                    or path_has('state["state"] == STATE_ACTIVE')
+                ) and path_has("recovery_latch_reached(nav_value, high_water)")
             else:
-                proven_branch = "raw_state is None" in branch_text
+                proven_branch = path_has("raw_state is None")
             if not proven_branch:
                 report(node, method.name, "writer_transition_guard_unproven")
             value = node.args[2]
@@ -1735,25 +1803,58 @@ def _repair15_dynamic_provenance_rows(
             for target in values:
                 db_path_names.update(_assignment_target_names(target))
 
-    risky_roots = {
-        name for name, origins in imports.items()
-        if any(
-            origin == "subprocess" or origin.startswith("subprocess.")
-            or origin in {"os", "asyncio", "importlib"}
-            for origin in origins
-        )
-    }
+    # Analyze each lexical scope independently. An unrelated local import or
+    # binding cannot poison (or authorize) another function's capability.
+    scope_nodes = [tree, *[n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]]
+    def scope_body(scope: ast.AST) -> list[ast.AST]:
+        return scope.body if isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)) else []
+    for scope in scope_nodes:
+        local_origin: dict[str, str] = {
+            alias.asname or "subprocess": "subprocess"
+            for stmt in tree.body
+            if isinstance(stmt, ast.Import)
+            for alias in stmt.names
+            if alias.name == "subprocess"
+        } if scope is not tree else {}
+        calls: list[ast.Call] = []
+        class ScopeVisitor(ast.NodeVisitor):
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                if node is scope:
+                    for statement in node.body: self.visit(statement)
+                # Do not descend into nested lexical scopes.
+            visit_AsyncFunctionDef = visit_FunctionDef
+            def visit_Lambda(self, node: ast.Lambda) -> None:
+                if node is scope: self.visit(node.body)
+            def visit_Import(self, node: ast.Import) -> None:
+                for alias in node.names:
+                    local_origin[alias.asname or alias.name.split(".", 1)[0]] = alias.name
+            def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+                if node.module:
+                    for alias in node.names:
+                        if alias.name != "*": local_origin[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+            def visit_Assign(self, node: ast.Assign) -> None:
+                self.generic_visit(node.value)
+                for target in node.targets:
+                    for name in _assignment_target_names(target): local_origin.pop(name, None)
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                if node.value: self.visit(node.value)
+                for name in _assignment_target_names(node.target): local_origin.pop(name, None)
+            def visit_Call(self, node: ast.Call) -> None:
+                calls.append(node); self.generic_visit(node)
+        ScopeVisitor().visit(scope)
+        for call in calls:
+            name = None
+            if isinstance(call.func, ast.Name): name = local_origin.get(call.func.id)
+            elif isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+                origin = local_origin.get(call.func.value.id)
+                if origin: name = f"{origin}.{call.func.attr}"
+            if name and (name == "subprocess.run" or name.startswith(("subprocess.", "os.", "asyncio.", "importlib."))):
+                if not (name == "subprocess.run" and _is_allowed_source_commit_subprocess(call, relative=relative, scope_name=scope.name if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)) else None)):
+                    report(call, "dynamic_process_capability_unproven")
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-            root_name = node.func.value.id
-            if root_name in risky_roots and (
-                len(imports.get(root_name, ())) > 1
-                or root_name in rebinding
-            ):
-                report(node, "ambiguous_dynamic_capability_import")
         callee = _call_name(node)
         if callee in {"open", "write_text", "write_bytes", "truncate", "unlink", "rename", "replace", "copyfile", "copyfileobj", "copy", "copy2", "move", "backup", "deserialize"}:
             receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
@@ -1786,6 +1887,26 @@ def _repair15_dynamic_provenance_rows(
                     continue
             report(node, "governed_db_file_write_surface")
 
+    # Propagate governed path provenance through assignments and derived Path
+    # expressions; unknown destructive receivers in the same lineage fail shut.
+    for scope in scope_nodes:
+        governed_names: set[str] = set()
+        nodes = list(ast.walk(scope))
+        for node in nodes:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                value = node.value
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                expression = ast.unparse(value).casefold() if value is not None else ""
+                is_db = "adaptive_paper.sqlite3" in expression or "adaptive_" in expression and "paper.sqlite3" in expression or any(isinstance(part, ast.Name) and part.id in governed_names for part in ast.walk(value)) if value is not None else False
+                if is_db:
+                    for target in targets: governed_names.update(_assignment_target_names(target))
+            if isinstance(node, ast.Call):
+                name = _call_name(node).casefold()
+                destructive = name in {"write_text", "write_bytes", "unlink", "replace", "rename", "truncate", "remove", "copy", "copy2", "copyfile", "move", "backup", "deserialize", "open"}
+                target_names = set().union(*(_assignment_target_names(x) for x in ast.walk(node) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load))) if any(isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load) for x in ast.walk(node)) else set()
+                if destructive and target_names & governed_names and not any(row.get("line") == getattr(node, "lineno", -1) and row.get("reason") == "governed_db_file_write_surface" for row in rows):
+                    report(node, "governed_db_file_write_surface")
+
     if relative == "app/recovery_authority.py":
         functions = [
             fn for fn in tree.body
@@ -1802,10 +1923,10 @@ def _repair15_dynamic_provenance_rows(
         ):
             return rows
         module_subprocess = [
-            node for node in tree.body
+            node for node in ast.walk(tree)
             if isinstance(node, ast.Import)
             for alias in node.names
-            if alias.name == "subprocess" and alias.asname is None
+            if alias.name == "subprocess"
         ]
         module_shadow = any(
             (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
@@ -1827,7 +1948,9 @@ def _repair15_dynamic_provenance_rows(
                 and not (facts["bound_names"] & {"str", "subprocess"})
                 and not fn.args.vararg and not fn.args.kwarg
             )
-        if not (valid_function and len(module_subprocess) == 1 and not module_shadow):
+        call_nodes = [n for n in ast.walk(functions[0]) if isinstance(n, ast.Call)] if valid_function else []
+        allowed_calls = [n for n in call_nodes if _is_allowed_source_commit_subprocess(n, relative=relative, scope_name="resolve_source_commit")]
+        if not (valid_function and len(module_subprocess) == 1 and not module_shadow and len(allowed_calls) == 1 and sum(1 for n in call_nodes if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == 'subprocess' and n.func.attr == 'run') == 1):
             report(functions[0] if functions else tree, "source_commit_subprocess_provenance_unproven")
 
     return rows
@@ -2399,31 +2522,42 @@ def _repository_script_escape_rows(root: Path) -> list[dict[str, Any]]:
                 "reason": "non_python_recovery_mutation_surface",
             })
             continue
-        authority_vars: set[str] = set()
-        for line in lines:
-            match = re.match(
-                r"(?i)^\s*\$(?!env:)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$",
-                line,
-            )
-            if match and authority_pattern.search(match.group(2)):
-                authority_vars.add(match.group(1))
-        for name in authority_vars:
-            uses = [
-                index + 1
-                for index, line in enumerate(lines)
-                if re.search("(?i)\\$" + re.escape(name) + r"\b", line)
-            ]
-            if len(uses) > 1:
-                rows.append({
-                    "path": relative_path.as_posix(),
-                    "line": uses[1],
-                    "function": "<script>",
-                    "call": path.suffix.casefold(),
-                    "key_status": "unresolved",
-                    "resolved_key": None,
-                    "reason": "non_python_recovery_mutation_surface",
-                })
-                break
+        # Conservative, whole-file taint for PowerShell/shell scripts. Values
+        # flow through variables, environment variables, Join-Path, string
+        # concatenation, and aliases without a line-distance limit.
+        tainted: set[str] = set()
+        assignment = re.compile(r"(?im)^\s*(\$(?:env:)?[A-Za-z_][\w:]*)\s*=\s*(.*)$")
+        destructive = re.compile(
+            r"(?i)(?:\b(?:clear-content|set-content|out-file|remove-item|move-item|copy-item|add-content|writeallbytes|writealltext|writebytes|truncate|(?<![.\w])sqlite3(?:\.exe)?|del|erase)\b|\[\s*io\.file\s*\]::(?:write|delete|move|replace)|\.write(?:all)?(?:bytes|text)\s*\()"
+        )
+        mutation_lines = [i + 1 for i, line in enumerate(lines) if destructive.search(line)]
+        changed = True
+        while changed:
+            changed = False
+            for match in assignment.finditer(text):
+                name, value = match.group(1).casefold(), match.group(2).casefold()
+                refs_tainted = authority_pattern.search(value) or any(
+                    re.search(r"(?i)(?<![\w])" + re.escape(ref.lstrip("$")) + r"\b", value)
+                    for ref in tainted
+                )
+                if refs_tainted and name not in tainted:
+                    tainted.add(name); changed = True
+        if tainted:
+            for line_number in mutation_lines:
+                line = lines[line_number - 1]
+                if authority_pattern.search(line) or any(
+                    re.search(r"(?i)(?<![\w])" + re.escape(name.lstrip("$")) + r"\b", line)
+                    for name in tainted
+                ):
+                    rows.append({
+                        "path": relative_path.as_posix(), "line": line_number,
+                        "function": "<script>", "call": path.suffix.casefold(),
+                        "key_status": "unresolved", "resolved_key": None,
+                        "reason": "non_python_recovery_mutation_surface",
+                    })
+                    break
+        if rows and rows[-1]["path"] == relative_path.as_posix():
+            continue
         if rows and rows[-1]["path"] == relative_path.as_posix():
             continue
         # A reconstructed DB path must not bypass the literal-string scanner.

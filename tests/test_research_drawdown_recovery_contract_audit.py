@@ -2711,7 +2711,10 @@ def test_repair15_untrusted_latched_reassignment_fails_closed(tmp_path: Path) ->
         text.replace(needle, '                latched = dict(latched, state=STATE_ACTIVE)\n' + needle, 1),
         encoding="utf-8",
     )
-    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(row["reason"] == "latched_reassignment_unproven"
+               for row in result["unresolved_kv_mutators"])
 
 
 def test_repair15_writable_database_open_fails_closed(tmp_path: Path) -> None:
@@ -2724,7 +2727,10 @@ def test_repair15_writable_database_open_fails_closed(tmp_path: Path) -> None:
         '        handle.write(b"replacement")\n',
         encoding="utf-8",
     )
-    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(row["reason"] == "governed_db_file_write_surface"
+               for row in result["unresolved_kv_mutators"])
 
 
 def test_repair15_source_commit_builtin_shadow_fails_closed(tmp_path: Path) -> None:
@@ -2767,7 +2773,7 @@ def test_repair15_import_scope_shadow_fails_closed(tmp_path: Path) -> None:
     )
     result = audit.audit_production_source_contract(repo)
     assert result["contract_ok"] is False
-    assert any(row["reason"] == "ambiguous_dynamic_capability_import"
+    assert any(row["reason"] == "dynamic_process_capability_unproven"
                for row in result["unresolved_kv_mutators"])
 
 
@@ -2801,6 +2807,85 @@ def test_repair15_env_db_path_script_mutation_fails_closed(tmp_path: Path) -> No
     result = audit.audit_production_source_contract(repo)
     assert result["contract_ok"] is False
     assert any(row["reason"] == "non_python_recovery_mutation_surface"
+               for row in result["unresolved_kv_mutators"])
+
+
+def test_repair16_writer_alias_is_reported_at_alias_site(tmp_path: Path) -> None:
+    repo = repair15_full_repo_copy(tmp_path)
+    path = repo / "app" / "storage.py"
+    text = path.read_text(encoding="utf-8")
+    needle = '                self._set_kv_conn(\n                    conn, RECOVERY_STATE_KEY, canonical_json(latched)\n                )\n'
+    assert needle in text
+    path.write_text(text.replace(
+        needle,
+        '                writer = self._set_kv_conn\n'
+        '                writer(conn, RECOVERY_STATE_KEY, canonical_json(latched))\n',
+        1,
+    ), encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    rows = result["unresolved_kv_mutators"]
+    assert result["contract_ok"] is False
+    assert any(row["path"] == "app/storage.py"
+               and row["reason"] in {"writer_callable_alias_unproven", "writer_callable_identity_unproven"}
+               for row in rows)
+
+
+def test_repair16_raw_sql_write_is_reported(tmp_path: Path) -> None:
+    repo = repair15_full_repo_copy(tmp_path)
+    path = repo / "app" / "storage.py"
+    text = path.read_text(encoding="utf-8")
+    needle = '                high_water = max(current, nav_value)\n'
+    path.write_text(text.replace(needle, needle +
+        "                conn.execute(\"UPDATE kv SET value='1' WHERE key='nav_high_water'\")\n",
+        1), encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(row["reason"] == "writer_raw_sql_mutation_unproven"
+               for row in result["unresolved_kv_mutators"])
+
+
+def test_repair16_tautological_branch_does_not_prove_write(tmp_path: Path) -> None:
+    repo = repair15_full_repo_copy(tmp_path)
+    path = repo / "app" / "storage.py"
+    text = path.read_text(encoding="utf-8")
+    needle = '            if (\n                state["state"] == STATE_ACTIVE\n                and recovery_latch_reached(nav_value, high_water)\n            ):\n'
+    assert needle in text
+    text = text.replace(needle, '            if recovery_latch_reached(nav_value, high_water) or True:\n', 1)
+    path.write_text(text, encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(row["reason"] == "writer_transition_guard_unproven"
+               for row in result["unresolved_kv_mutators"])
+
+
+def test_repair16_local_from_import_and_unrelated_shadow_are_scoped(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "scope.py").write_text(
+        'def launch():\n    from subprocess import run as execute\n'
+        '    execute(["echo", "x"])\n'
+        'def noise():\n    import pathlib as execute\n    return execute.Path(".")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert any(row["reason"] == "dynamic_process_capability_unproven"
+               and row["path"] == "scripts/scope.py"
+               for row in result["unresolved_kv_mutators"])
+
+
+def test_repair16_long_distance_join_path_power_shell_write_is_reported(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "long.ps1").write_text(
+        '$root = "data"\n$p = Join-Path $root ("adaptive_" + "paper.sqlite3")\n'
+        + "\n" * 8 + '[IO.File]::WriteAllBytes($p, @())\n', encoding="utf-8"
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(row["reason"] == "non_python_recovery_mutation_surface"
+               and row["path"] == "scripts/long.ps1"
                for row in result["unresolved_kv_mutators"])
 
 
