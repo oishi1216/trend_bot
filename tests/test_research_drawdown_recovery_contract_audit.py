@@ -2681,3 +2681,183 @@ def test_repair14_import_alias_is_not_hidden_by_unrelated_shadow() -> None:
     )
     bindings = audit._qualified_bindings(tree)
     assert bindings["sp"] == "subprocess"
+
+
+def test_repair15_composite_safe_fragment_must_not_escape(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    folder = repo / "scripts"
+    folder.mkdir()
+    (folder / "composite.py").write_text(
+        'def go(storage, fragment):\n'
+        '    storage.set_kv("nav_" + f"high_{fragment}", "0")\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+def test_repair15_untrusted_latched_reassignment_fails_closed(tmp_path: Path) -> None:
+    from shutil import copytree, ignore_patterns
+
+    repo = tmp_path
+    source_root = Path(audit.__file__).resolve().parents[1]
+    copytree(source_root / "app", repo / "app", ignore=ignore_patterns("__pycache__"))
+    copytree(source_root / "scripts", repo / "scripts", ignore=ignore_patterns("__pycache__"))
+    path = repo / "app" / "storage.py"
+    text = path.read_text(encoding="utf-8")
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is True
+    needle = '                self._set_kv_conn(\n                    conn, RECOVERY_STATE_KEY, canonical_json(latched)\n                )\n'
+    assert needle in text
+    path.write_text(
+        text.replace(needle, '                latched = dict(latched, state=STATE_ACTIVE)\n' + needle, 1),
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+def test_repair15_writable_database_open_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "database_open.py").write_text(
+        'def go():\n'
+        '    with open("data/adaptive_paper.sqlite3", "wb") as handle:\n'
+        '        handle.write(b"replacement")\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+def test_repair15_source_commit_builtin_shadow_fails_closed(tmp_path: Path) -> None:
+    repo = repair15_full_repo_copy(tmp_path)
+    p = repo / "app" / "recovery_authority.py"
+    content = p.read_text(encoding="utf-8")
+    needle = "def resolve_source_commit("
+    assert needle in content
+    p.write_text(
+        content.replace(needle, "def str(value):\n    return value\n\n" + needle, 1),
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+def test_repair15_constructed_script_db_write_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "constructed.ps1").write_text(
+        '$db = "data/" + "adaptive_" + "paper.sqlite3"\n'
+        '[System.IO.File]::WriteAllBytes($db, @())\n',
+        encoding="utf-8",
+    )
+    assert audit.audit_production_source_contract(repo)["contract_ok"] is False
+
+
+def test_repair15_import_scope_shadow_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "capability.py").write_text(
+        'import subprocess as sp\n'
+        'def run():\n'
+        '    sp.run(["echo", "x"])\n'
+        'def noise():\n'
+        '    import pathlib as sp\n'
+        '    return sp.Path(".")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(row["reason"] == "ambiguous_dynamic_capability_import"
+               for row in result["unresolved_kv_mutators"])
+
+
+def test_repair15_db_path_alias_write_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "db_path.py").write_text(
+        'from pathlib import Path\n'
+        'def go():\n'
+        '    p = Path("data") / "adaptive_paper.sqlite3"\n'
+        '    p.write_bytes(b"")\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(row["reason"] == "governed_db_file_write_surface"
+               for row in result["unresolved_kv_mutators"])
+
+
+def test_repair15_env_db_path_script_mutation_fails_closed(tmp_path: Path) -> None:
+    repo = write_repo(tmp_path)
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    (scripts / "env_rewrite.ps1").write_text(
+        '$env:DB_PATH = "data/adaptive_paper.sqlite3"\n'
+        '# unrelated comment\n# another unrelated comment\n'
+        'Clear-Content $env:DB_PATH\n',
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(row["reason"] == "non_python_recovery_mutation_surface"
+               for row in result["unresolved_kv_mutators"])
+
+
+def repair15_full_repo_copy(tmp_path: Path) -> Path:
+    from shutil import copytree, ignore_patterns
+    source = Path(audit.__file__).resolve().parents[1]
+    copytree(source / "app", tmp_path / "app", ignore=ignore_patterns("__pycache__"))
+    copytree(source / "scripts", tmp_path / "scripts", ignore=ignore_patterns("__pycache__"))
+    assert audit.audit_production_source_contract(tmp_path)["contract_ok"] is True
+    return tmp_path
+
+
+def test_repair15_source_commit_builtin_shadow_actual_fails_closed(tmp_path: Path) -> None:
+    repo = repair15_full_repo_copy(tmp_path)
+    path = repo / "app" / "recovery_authority.py"
+    text = path.read_text(encoding="utf-8")
+    needle = "def resolve_source_commit("
+    assert text.count(needle) == 1
+    path.write_text(text.replace(needle, "def str(value):\n    return value\n\n" + needle, 1),
+                    encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+
+
+def test_repair15_high_water_extra_write_in_trusted_method_fails_closed(
+    tmp_path: Path,
+) -> None:
+    repo = repair15_full_repo_copy(tmp_path)
+    path = repo / "app" / "storage.py"
+    text = path.read_text(encoding="utf-8")
+    needle = '                high_water = max(current, nav_value)\n'
+    assert text.count(needle) == 1
+    replacement = (
+        needle
+        + '                self._set_kv_conn(conn, "nav_high_water", "1.0")\n'
+    )
+    path.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert result["unresolved_kv_mutators"]
+
+
+def test_repair15_inplace_latch_mutation_fails_closed(tmp_path: Path) -> None:
+    repo = repair15_full_repo_copy(tmp_path)
+    path = repo / "app" / "storage.py"
+    text = path.read_text(encoding="utf-8")
+    needle = '                self._set_kv_conn(\n                    conn, RECOVERY_STATE_KEY, canonical_json(latched)\n                )\n'
+    assert text.count(needle) == 1
+    path.write_text(
+        text.replace(
+            needle,
+            '                latched.update({"state": STATE_ACTIVE})\n' + needle,
+            1,
+        ),
+        encoding="utf-8",
+    )
+    result = audit.audit_production_source_contract(repo)
+    assert result["contract_ok"] is False
+    assert any(row["reason"] == "recovery_value_inplace_mutation"
+               for row in result["unresolved_kv_mutators"])

@@ -1443,6 +1443,394 @@ def _recovery_writer_identity_issue(
     }
 
 
+def _repair15_writer_value_rows(
+    tree: ast.Module,
+    *,
+    relative: str,
+) -> list[dict[str, Any]]:
+    """Conservative Recovery writer proof; never grant authority by name alone.
+
+    This is deliberately a narrow guard over app/storage.py. It rejects
+    additional writes or unsafe value producers even in the two trusted
+    method names. It is additive to the existing closed-world scanner.
+    """
+    if relative != "app/storage.py":
+        return []
+    parents = _whole_tree_parent_map(tree)
+    storage_classes = [
+        n for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == "Storage"
+    ]
+    rows: list[dict[str, Any]] = []
+    if len(storage_classes) != 1:
+        return [{
+            "path": relative, "line": 0, "function": "Storage",
+            "call": "recovery_writer", "key_status": "unresolved",
+            "resolved_key": None, "reason": "writer_value_identity_ambiguous",
+        }]
+
+    def report(node: ast.AST, owner: str, reason: str) -> None:
+        rows.append({
+            "path": relative,
+            "line": int(getattr(node, "lineno", 0)),
+            "function": owner,
+            "call": "_set_kv_conn",
+            "key_status": "unresolved",
+            "resolved_key": None,
+            "reason": reason,
+        })
+
+    trusted = {
+        "update_nav_high_water_atomic": {"nav_high_water": 2},
+        "_evaluate_recovery_locked": {
+            "nav_high_water": 2,
+            _RECOVERY_STATE_KEY: 3,
+            _RECOVERY_INITIALIZED_KEY: 2,
+        },
+    }
+    for method in storage_classes[0].body:
+        if not isinstance(method, ast.FunctionDef) or method.name not in trusted:
+            continue
+        observed: dict[str, int] = {}
+        name_assignments: dict[str, list[ast.Assign]] = {
+            name: [] for name in ("state", "latched", "high_water")
+        }
+        for node in ast.walk(method):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id in name_assignments:
+                        name_assignments[target.id].append(node)
+            # Trusted state constructors do not authorize later in-place edits.
+            targets = (
+                node.targets if isinstance(node, (ast.Assign, ast.Delete))
+                else [node.target] if isinstance(
+                    node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)
+                )
+                else []
+            )
+            for target in targets:
+                if (
+                    isinstance(target, (ast.Subscript, ast.Attribute))
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id in {"state", "latched"}
+                ):
+                    report(node, method.name, "recovery_value_inplace_mutation")
+                if (
+                    not isinstance(node, ast.Assign)
+                    and isinstance(target, ast.Name)
+                    and target.id in {"state", "latched", "high_water"}
+                ):
+                    report(node, method.name, "recovery_binding_reassignment")
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in {"state", "latched"}
+                and node.func.attr in {
+                    "update", "clear", "pop", "popitem", "setdefault",
+                    "__setitem__", "__delitem__"
+                }
+            ):
+                report(node, method.name, "recovery_value_inplace_mutation")
+            if not isinstance(node, ast.Call) or _call_name(node) != "_set_kv_conn":
+                continue
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+                and len(node.args) == 3
+                and not node.keywords
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "conn"
+            ):
+                report(node, method.name, "writer_connection_unproven")
+                continue
+            key = _recovery_key_value(node.args[1], bindings={})
+            if key is None:
+                key = _static_string_value(node.args[1])
+            if key not in _GOVERNED_RECOVERY_KEYS:
+                continue
+            observed[key] = observed.get(key, 0) + 1
+            # The write must occur in an approved branch's *body*, not just
+            # somewhere inside the trusted function or the branch's else arm.
+            body_conditions: list[str] = []
+            cursor: ast.AST = node
+            while cursor in parents:
+                ancestor = parents[cursor]
+                if isinstance(ancestor, ast.If) and cursor in ancestor.body:
+                    body_conditions.append(ast.unparse(ancestor.test))
+                cursor = ancestor
+            branch_text = " ".join(body_conditions)
+            if method.name == "update_nav_high_water_atomic":
+                minimal_atomic_max = (
+                    not any(isinstance(candidate, ast.If) for candidate in ast.walk(method))
+                    and sum(
+                        1 for candidate in ast.walk(method)
+                        if isinstance(candidate, ast.Call)
+                        and _call_name(candidate) == "_set_kv_conn"
+                    ) == 1
+                    and any(
+                        isinstance(candidate, ast.Assign)
+                        and any(
+                            isinstance(target, ast.Name) and target.id == "high_water"
+                            for target in candidate.targets
+                        )
+                        and ast.unparse(candidate.value) == "max(current, nav_value)"
+                        for candidate in ast.walk(method)
+                    )
+                )
+                proven_branch = key == _NAV_HIGH_WATER_KEY and (
+                    "raw is None" in branch_text
+                    or "high_water != current" in branch_text
+                    or minimal_atomic_max
+                )
+            elif key == _NAV_HIGH_WATER_KEY:
+                proven_branch = (
+                    "raw_state is None" in branch_text
+                    or "nav_value > high_water" in branch_text
+                )
+            elif key == _RECOVERY_STATE_KEY:
+                proven_branch = (
+                    "raw_state is None" in branch_text
+                    or "recovery_latch_reached(" in branch_text
+                )
+            else:
+                proven_branch = "raw_state is None" in branch_text
+            if not proven_branch:
+                report(node, method.name, "writer_transition_guard_unproven")
+            value = node.args[2]
+            if key == _NAV_HIGH_WATER_KEY:
+                valid = (
+                    isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id == "canonical_float_text"
+                    and len(value.args) == 1 and not value.keywords
+                    and isinstance(value.args[0], ast.Name)
+                    and value.args[0].id == "high_water"
+                )
+            elif key == _RECOVERY_STATE_KEY:
+                valid = (
+                    method.name == "_evaluate_recovery_locked"
+                    and isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id == "canonical_json"
+                    and len(value.args) == 1 and not value.keywords
+                    and isinstance(value.args[0], ast.Name)
+                    and value.args[0].id in {"state", "latched"}
+                )
+            else:
+                valid = (
+                    method.name == "_evaluate_recovery_locked"
+                    and isinstance(value, ast.Name)
+                    and value.id == "RECOVERY_INITIALIZED_VALUE"
+                )
+            if not valid:
+                report(node, method.name, "writer_value_provenance_unproven")
+
+        for key, count in observed.items():
+            if count > trusted[method.name].get(key, 0):
+                report(method, method.name, "extra_governed_writer")
+
+        high_water = name_assignments["high_water"]
+        if len(high_water) > (2 if method.name == "update_nav_high_water_atomic" else 4):
+            report(method, method.name, "high_water_extra_assignment")
+        for assignment in high_water:
+            expr = assignment.value
+            acceptable = (
+                isinstance(expr, ast.Name) and expr.id == "nav_value"
+            ) or (
+                isinstance(expr, ast.Call)
+                and isinstance(expr.func, ast.Name)
+                and expr.func.id in {"max", "parse_positive_float_text"}
+            )
+            if not acceptable:
+                report(assignment, method.name, "high_water_value_unproven")
+
+        if method.name == "_evaluate_recovery_locked":
+            if len(name_assignments["latched"]) > 1:
+                report(method, method.name, "latched_reassignment_unproven")
+            for assignment in name_assignments["latched"]:
+                if not (
+                    isinstance(assignment.value, ast.Call)
+                    and _call_name(assignment.value) == "latched_state"
+                ):
+                    report(assignment, method.name, "latched_value_unproven")
+            if len(name_assignments["state"]) > 4:
+                report(method, method.name, "recovery_state_extra_assignment")
+            for assignment in name_assignments["state"]:
+                if _call_name(assignment.value) not in {
+                    "active_state", "parse_recovery_state", "latched_state"
+                }:
+                    report(assignment, method.name, "recovery_state_value_unproven")
+
+    return rows
+
+
+def _repair15_dynamic_provenance_rows(
+    tree: ast.Module,
+    *,
+    relative: str,
+) -> list[dict[str, Any]]:
+    """Conservative secondary proof for imports, process and DB-file writes."""
+    parents = _whole_tree_parent_map(tree)
+    rows: list[dict[str, Any]] = []
+    imports: dict[str, set[str]] = {}
+    rebinding: set[str] = set()
+
+    def report(node: ast.AST, kind: str) -> None:
+        function_name, _ = _enclosing_function_and_class(node, parents)
+        rows.append({
+            "path": relative,
+            "line": int(getattr(node, "lineno", 0)),
+            "function": function_name or "<module>",
+            "call": _call_name(node) if isinstance(node, ast.Call) else "binding",
+            "key_status": "unresolved",
+            "resolved_key": None,
+            "reason": kind,
+        })
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                local = alias.asname or alias.name.split(".", 1)[0]
+                imports.setdefault(local, set()).add(alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                if alias.name != "*":
+                    imports.setdefault(alias.asname or alias.name, set()).add(
+                        f"{node.module}.{alias.name}"
+                    )
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = (
+                node.targets if isinstance(node, ast.Assign)
+                else [node.target]
+            )
+            for target in targets:
+                rebinding.update(_assignment_target_names(target))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            rebinding.add(node.name)
+
+    # Track aliases of a governed DB path, including Path(...) / "filename".
+    # Do not infer safety from a short variable name such as "p".
+    db_path_names: set[str] = set()
+    for assignment in ast.walk(tree):
+        if isinstance(assignment, ast.Assign):
+            values = assignment.targets
+            expression = assignment.value
+        elif isinstance(assignment, ast.AnnAssign):
+            values = [assignment.target]
+            expression = assignment.value
+        else:
+            continue
+        if expression is None:
+            continue
+        unparsed = ast.unparse(expression).casefold()
+        literal = _static_text_expression(expression)
+        looks_governed = (
+            "adaptive_paper.sqlite3" in unparsed
+            or literal is not None and "adaptive_paper.sqlite3" in literal.casefold()
+            or ("adaptive_" in unparsed and "paper.sqlite3" in unparsed)
+        )
+        if looks_governed:
+            for target in values:
+                db_path_names.update(_assignment_target_names(target))
+
+    risky_roots = {
+        name for name, origins in imports.items()
+        if any(
+            origin == "subprocess" or origin.startswith("subprocess.")
+            or origin in {"os", "asyncio", "importlib"}
+            for origin in origins
+        )
+    }
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            root_name = node.func.value.id
+            if root_name in risky_roots and (
+                len(imports.get(root_name, ())) > 1
+                or root_name in rebinding
+            ):
+                report(node, "ambiguous_dynamic_capability_import")
+        callee = _call_name(node)
+        if callee in {"open", "write_text", "write_bytes", "truncate", "unlink", "rename", "replace", "copyfile", "copyfileobj", "copy", "copy2", "move", "backup", "deserialize"}:
+            receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
+            target = (
+                node.args[0] if isinstance(node.func, ast.Name) and node.args
+                else receiver
+            )
+            if target is None:
+                continue
+            expression = ast.unparse(target).casefold()
+            literal = " ".join(_literal_strings(target)).casefold()
+            could_be_db = (
+                "adaptive_paper" in expression
+                or "adaptive_paper" in literal
+                or "db_path" in expression
+                or (isinstance(target, ast.Name) and target.id.lower() in {"db", "database"})
+                or (isinstance(target, ast.Name) and target.id in db_path_names)
+            )
+            if not could_be_db:
+                continue
+            if callee == "open":
+                mode = (
+                    _static_string_value(node.args[1]) if len(node.args) > 1
+                    else next(
+                        (_static_string_value(kw.value) for kw in node.keywords if kw.arg == "mode"),
+                        None,
+                    )
+                )
+                if mode is not None and not any(char in mode for char in "wax+"):
+                    continue
+            report(node, "governed_db_file_write_surface")
+
+    if relative == "app/recovery_authority.py":
+        functions = [
+            fn for fn in tree.body
+            if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and fn.name == "resolve_source_commit"
+        ]
+        if not functions and not any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "subprocess"
+            and node.func.attr == "run"
+            for node in ast.walk(tree)
+        ):
+            return rows
+        module_subprocess = [
+            node for node in tree.body
+            if isinstance(node, ast.Import)
+            for alias in node.names
+            if alias.name == "subprocess" and alias.asname is None
+        ]
+        module_shadow = any(
+            (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+             and node.name in {"str", "subprocess"})
+            or (isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                and bool(set().union(*(
+                    _assignment_target_names(target)
+                    for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+                )) & {"str", "subprocess"}))
+            for node in tree.body
+        )
+        valid_function = len(functions) == 1 and isinstance(functions[0], ast.FunctionDef)
+        if valid_function:
+            fn = functions[0]
+            params = [arg.arg for arg in [*fn.args.posonlyargs, *fn.args.args]]
+            facts = _scope_binding_facts(fn)
+            valid_function = (
+                params == ["repo_root"]
+                and not (facts["bound_names"] & {"str", "subprocess"})
+                and not fn.args.vararg and not fn.args.kwarg
+            )
+        if not (valid_function and len(module_subprocess) == 1 and not module_shadow):
+            report(functions[0] if functions else tree, "source_commit_subprocess_provenance_unproven")
+
+    return rows
 def _lexical_scope_nodes(tree: ast.Module) -> list[ast.AST]:
     return [
         tree,
@@ -2037,6 +2425,43 @@ def _repository_script_escape_rows(root: Path) -> list[dict[str, Any]]:
                 })
                 break
         if rows and rows[-1]["path"] == relative_path.as_posix():
+            continue
+        # A reconstructed DB path must not bypass the literal-string scanner.
+        # Require both a plausible governed DB name and a destructive API.
+        lowered = text.casefold()
+        constructed_db = (
+            "adaptive_paper.sqlite3" not in lowered
+            and (
+                ("adaptive_" in lowered and "paper.sqlite3" in lowered)
+                or ("adaptive" in lowered and "paper" in lowered and "sqlite3" in lowered)
+            )
+        )
+        destructive_script = bool(re.search(
+            r"(?i)(?:writeallbytes|writealltext|clear-content|set-content|"
+            r"out-file|remove-item|move-item|copy-item|truncate|sqlite3|"
+            r"invoke-dbreplacement|writebytes|write-text)",
+            text,
+        ))
+        env_db_reference = bool(re.search(
+            r"(?im)^\s*\$env:DB_PATH\s*=\s*[^\r\n]*adaptive_paper\.sqlite3",
+            text,
+        ))
+        env_db_mutation = bool(re.search(
+            r"(?im)\b(?:clear-content|set-content|out-file|remove-item|"
+            r"move-item|copy-item|writeallbytes|writealltext|truncate)\b"
+            r"[^\r\n]*\$env:DB_PATH\b",
+            text,
+        ))
+        if (constructed_db and destructive_script) or (
+            env_db_reference and env_db_mutation
+        ):
+            rows.append({
+                "path": relative_path.as_posix(),
+                "line": 0, "function": "<script>",
+                "call": path.suffix.casefold(),
+                "key_status": "unresolved", "resolved_key": None,
+                "reason": "non_python_recovery_mutation_surface",
+            })
             continue
         for index in range(len(lines)):
             window = "\n".join(lines[index : index + 3])
@@ -3238,8 +3663,8 @@ def _resolve_key_expression(
             return "safe_non_target", left_value
         if right_status == "exact" and right_value and _fragment_excludes_governed_keys(right_value, position="suffix"):
             return "safe_non_target", right_value
-        if left_status == "safe_non_target" or right_status == "safe_non_target":
-            return "safe_non_target", None
+        # A non-target fragment cannot prove that its enclosing expression
+        # remains disjoint from the governed Recovery keys.
         return "unresolved", None
 
     if isinstance(expression, ast.Call):
@@ -4035,6 +4460,21 @@ def audit_production_source_contract(repo_root: str | Path) -> dict[str, Any]:
             )
         )
     unresolved_kv_mutators.extend(_repository_foreign_dispatch_rows(root))
+    for guard_path in sorted(root.rglob("*.py")):
+        if not _authority_python_file_is_in_scope(root, guard_path):
+            continue
+        guard_relative = guard_path.relative_to(root).as_posix()
+        guard_tree = ast.parse(guard_path.read_text(encoding="utf-8"))
+        unresolved_kv_mutators.extend(
+            _repair15_dynamic_provenance_rows(guard_tree, relative=guard_relative)
+        )
+    for repair15_path in sorted(root.rglob("*.py")):
+        if repair15_path.relative_to(root).as_posix() != "app/storage.py":
+            continue
+        repair15_tree = ast.parse(repair15_path.read_text(encoding="utf-8"))
+        unresolved_kv_mutators.extend(
+            _repair15_writer_value_rows(repair15_tree, relative="app/storage.py")
+        )
     unresolved_kv_mutators.extend(_repository_script_escape_rows(root))
 
     for (
